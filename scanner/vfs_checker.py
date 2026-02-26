@@ -87,15 +87,28 @@ class VFSChecker:
         """Navigate to login page and authenticate."""
         print(f"[{datetime.now()}] Navigating to login page...")
         await page.goto(f"{VFS_BASE_URL}/login", wait_until="networkidle")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
-        # Fill in credentials
-        email_input = page.locator('input[type="text"]').first
-        password_input = page.locator('input[type="password"]').first
+        # Debug: screenshot and log what inputs exist
+        await page.screenshot(path="login_page.png")
+        inputs = await page.locator("input").all()
+        for i, inp in enumerate(inputs):
+            inp_type = await inp.get_attribute("type") or "unknown"
+            inp_id = await inp.get_attribute("id") or ""
+            inp_name = await inp.get_attribute("name") or ""
+            inp_placeholder = await inp.get_attribute("placeholder") or ""
+            print(f"[DEBUG] input[{i}]: type={inp_type} id={inp_id} name={inp_name} placeholder={inp_placeholder}")
 
+        # Fill in credentials - try multiple selectors
+        email_input = page.locator('input[type="email"], input[type="text"], input#email, input[name="email"], input[placeholder*="mail" i]').first
+        await email_input.wait_for(state="visible", timeout=15000)
         await email_input.fill(VFS_EMAIL)
+        print("[LOGIN] Email entered")
+
+        password_input = page.locator('input[type="password"]').first
+        await password_input.wait_for(state="visible", timeout=15000)
         await password_input.fill(VFS_PASSWORD)
-        print("[LOGIN] Credentials entered")
+        print("[LOGIN] Password entered")
 
         # Wait for Cloudflare Turnstile to resolve
         print("[LOGIN] Waiting for Cloudflare challenge...")
