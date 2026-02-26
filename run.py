@@ -6,9 +6,9 @@ Checks for available appointment slots at configured VFS centres
 and sends WhatsApp notifications when slots are found.
 
 Usage:
-    python run.py                  # Check and notify only if slots found
-    python run.py --always-notify  # Always send notification with results
-    python run.py --dry-run        # Check but don't send notifications
+    python3 run.py                  # Check and notify only if slots found
+    python3 run.py --always-notify  # Always send notification with results
+    python3 run.py --dry-run        # Check but don't send notifications
 """
 
 import asyncio
@@ -52,13 +52,9 @@ async def run():
             print("[OK] Notification sent!")
         else:
             print("[WARN] Failed to send notification")
-            # Print message to stdout so GitHub Actions logs capture it
             print(f"\nMessage:\n{message}")
 
-    # Exit with code 0 if slots found (for GitHub Actions)
     if has_availability:
-        # Write to GitHub Actions output if available
-        github_output = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].startswith("/") else None
         print("\n✅ Appointment slots are available!")
 
 

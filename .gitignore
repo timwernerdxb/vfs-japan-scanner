@@ -4,3 +4,5 @@ __pycache__/
 *.png
 .venv/
 venv/
+session.json
+api_config.json
