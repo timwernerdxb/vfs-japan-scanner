@@ -15,7 +15,30 @@ import re
 import time
 from datetime import datetime
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+
+
+STEALTH_JS = """
+() => {
+    // Overwrite navigator.webdriver
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    // Overwrite chrome runtime
+    window.chrome = {runtime: {}};
+    // Overwrite permissions
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters);
+    // Overwrite plugins
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+    });
+    // Overwrite languages
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+    });
+}
+"""
 
 # Configuration from environment variables
 VFS_EMAIL = os.environ.get("VFS_EMAIL")
@@ -62,9 +85,11 @@ class VFSChecker:
                 ),
             )
 
+            # Apply stealth patches before any navigation
+            await context.add_init_script(STEALTH_JS)
+
             # Intercept network requests to discover API endpoints
             page = await context.new_page()
-            await stealth_async(page)
             page.on("response", self._capture_api_response)
 
             try:
@@ -88,8 +113,8 @@ class VFSChecker:
     async def _login(self, page):
         """Navigate to login page and authenticate."""
         print(f"[{datetime.now()}] Navigating to login page...")
-        await page.goto(f"{VFS_BASE_URL}/login", wait_until="networkidle")
-        await page.wait_for_timeout(3000)
+        await page.goto(f"{VFS_BASE_URL}/login", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(5000)
 
         # Debug: screenshot and log what inputs exist
         await page.screenshot(path="login_page.png")
@@ -169,7 +194,7 @@ class VFSChecker:
             # Navigate to appointment details
             await page.goto(
                 f"{VFS_BASE_URL}/application-detail",
-                wait_until="networkidle",
+                wait_until="domcontentloaded",
             )
             await page.wait_for_timeout(2000)
 
