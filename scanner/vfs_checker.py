@@ -15,6 +15,7 @@ import re
 import time
 from datetime import datetime
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 # Configuration from environment variables
 VFS_EMAIL = os.environ.get("VFS_EMAIL")
@@ -63,6 +64,7 @@ class VFSChecker:
 
             # Intercept network requests to discover API endpoints
             page = await context.new_page()
+            await stealth_async(page)
             page.on("response", self._capture_api_response)
 
             try:
