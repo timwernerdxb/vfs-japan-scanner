@@ -32,13 +32,8 @@ jobs:
         env:
           VFS_EMAIL: ${{ secrets.VFS_EMAIL }}
           VFS_PASSWORD: ${{ secrets.VFS_PASSWORD }}
-          NOTIFY_METHOD: ${{ vars.NOTIFY_METHOD || 'callmebot' }}
           WHATSAPP_NUMBER: ${{ secrets.WHATSAPP_NUMBER }}
-          WHATSAPP_WEBHOOK_URL: ${{ secrets.WHATSAPP_WEBHOOK_URL }}
           CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
-          TWILIO_SID: ${{ secrets.TWILIO_SID }}
-          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
-          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
         run: python run.py
 
       - name: Upload debug screenshots
