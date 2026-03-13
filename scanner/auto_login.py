@@ -16,7 +16,7 @@ import logging
 import os
 from datetime import datetime
 
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 
 from scanner.captcha_solver import solve_turnstile
 
@@ -141,6 +141,9 @@ async def _do_login() -> dict:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
+                "--disable-infobars",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
             ],
         )
         context = await browser.new_context(
@@ -149,12 +152,43 @@ async def _do_login() -> dict:
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
+            timezone_id="Asia/Dubai",
         )
         page = await context.new_page()
 
-        # Anti-detection: remove webdriver flag
-        await page.add_init_script("""
+        # Comprehensive anti-detection stealth patches
+        await context.add_init_script("""
+        () => {
+            // Overwrite navigator.webdriver
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            // Chrome runtime
+            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+            // Permissions
+            const origQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (params) =>
+                params.name === 'notifications'
+                    ? Promise.resolve({state: Notification.permission})
+                    : origQuery(params);
+            // Plugins (non-empty array)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            // Languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            // Connection
+            Object.defineProperty(navigator, 'connection', {
+                get: () => ({rtt: 50, downlink: 10, effectiveType: '4g', saveData: false}),
+            });
+            // Hardware concurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+            // Device memory
+            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            // Platform
+            Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
+        }
         """)
 
         # Intercept API requests to capture auth headers
@@ -171,8 +205,8 @@ async def _do_login() -> dict:
         try:
             # Navigate to login page
             logger.info("Navigating to VFS login page...")
-            await page.goto(VFS_LOGIN_URL, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(3000)
+            await page.goto(VFS_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(5000)
 
             # Debug: log page state after initial load
             page_title = await page.title()
@@ -184,6 +218,14 @@ async def _do_login() -> dict:
                 await page.wait_for_timeout(10000)
                 page_title = await page.title()
                 logger.info("After wait — URL: %s | Title: %s", page.url, page_title)
+
+            # Check if VFS blocked us (redirects to page-not-found)
+            if "page-not-found" in page.url or "unable to progress" in page_title.lower():
+                await _log_page_debug(page, "blocked")
+                raise RuntimeError(
+                    "VFS blocked the request (page-not-found). "
+                    "IP may be rate-limited — will retry with backoff."
+                )
 
             # Dismiss cookie consent banner (OneTrust)
             # VFS uses OneTrust — the banner blocks form interaction
