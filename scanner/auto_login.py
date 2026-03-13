@@ -15,6 +15,7 @@ import base64
 import logging
 import os
 from datetime import datetime
+from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
 
@@ -148,8 +149,14 @@ async def _do_login() -> dict:
             ],
         )
         if PROXY_URL:
-            launch_opts["proxy"] = {"server": PROXY_URL}
-            logger.info("Using proxy: %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
+            parsed = urlparse(PROXY_URL)
+            proxy_conf = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+            if parsed.username:
+                proxy_conf["username"] = parsed.username
+            if parsed.password:
+                proxy_conf["password"] = parsed.password
+            launch_opts["proxy"] = proxy_conf
+            logger.info("Using proxy: %s:%s", parsed.hostname, parsed.port)
         browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
@@ -210,20 +217,28 @@ async def _do_login() -> dict:
         try:
             # Navigate to login page
             logger.info("Navigating to VFS login page...")
-            await page.goto(VFS_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(VFS_LOGIN_URL, wait_until="load", timeout=60000)
 
-            # Wait for Angular app to bootstrap — look for the login form
-            logger.info("Waiting for Angular app to load...")
-            try:
-                await page.wait_for_selector(
-                    "#mat-input-0, input[type='email'], app-login",
-                    timeout=30000,
-                )
-                logger.info("Login form detected")
-            except Exception:
-                # Give extra time — Angular can be slow
-                logger.warning("Login form not found after 30s, waiting longer...")
-                await page.wait_for_timeout(10000)
+            # Wait for Cloudflare JS challenge to resolve + Angular to bootstrap
+            # The page may be empty initially while CF verifies the browser
+            logger.info("Waiting for page to fully load (CF challenge + Angular)...")
+            for attempt_wait in range(6):  # Up to 60s total (6 x 10s)
+                try:
+                    await page.wait_for_selector(
+                        "#mat-input-0, input[type='email'], app-login, mat-form-field",
+                        timeout=10000,
+                    )
+                    logger.info("Login form detected")
+                    break
+                except Exception:
+                    title = await page.title()
+                    url = page.url
+                    logger.info("Wait %d/6 — no form yet. URL: %s | Title: %s", attempt_wait + 1, url, title)
+                    if "page-not-found" in url:
+                        break  # Will be caught by the check below
+            else:
+                logger.warning("Login form not found after 60s")
+                await _log_page_debug(page, "form-not-found")
 
             # Debug: log page state after load
             page_title = await page.title()
