@@ -211,9 +211,21 @@ async def _do_login() -> dict:
             # Navigate to login page
             logger.info("Navigating to VFS login page...")
             await page.goto(VFS_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(5000)
 
-            # Debug: log page state after initial load
+            # Wait for Angular app to bootstrap — look for the login form
+            logger.info("Waiting for Angular app to load...")
+            try:
+                await page.wait_for_selector(
+                    "#mat-input-0, input[type='email'], app-login",
+                    timeout=30000,
+                )
+                logger.info("Login form detected")
+            except Exception:
+                # Give extra time — Angular can be slow
+                logger.warning("Login form not found after 30s, waiting longer...")
+                await page.wait_for_timeout(10000)
+
+            # Debug: log page state after load
             page_title = await page.title()
             logger.info("Page loaded — URL: %s | Title: %s", page.url, page_title)
 
