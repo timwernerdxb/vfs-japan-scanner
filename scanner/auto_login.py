@@ -24,6 +24,7 @@ VFS_LOGIN_URL = "https://visa.vfsglobal.com/are/en/prt/login"
 
 VFS_EMAIL = os.environ.get("VFS_EMAIL", "")
 VFS_PASSWORD = os.environ.get("VFS_PASSWORD", "")
+PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. http://user:pass@host:port
 
 logger = logging.getLogger("auto_login")
 
@@ -135,7 +136,7 @@ async def _do_login() -> dict:
     captured_headers = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
+        launch_opts = dict(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -146,6 +147,10 @@ async def _do_login() -> dict:
                 "--disable-renderer-backgrounding",
             ],
         )
+        if PROXY_URL:
+            launch_opts["proxy"] = {"server": PROXY_URL}
+            logger.info("Using proxy: %s", PROXY_URL.split("@")[-1] if "@" in PROXY_URL else PROXY_URL)
+        browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
