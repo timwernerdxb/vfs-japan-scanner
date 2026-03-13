@@ -14,6 +14,8 @@ import asyncio
 import base64
 import logging
 import os
+import socket
+import threading
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -133,9 +135,103 @@ async def _log_page_debug(page, label="debug"):
         logger.warning("[%s] Could not capture debug info: %s", label, e)
 
 
+def _start_auth_proxy(upstream_host, upstream_port, username, password):
+    """
+    Start a local TCP proxy that injects Proxy-Authorization into CONNECT requests.
+
+    Chromium expects a 407 challenge before sending auth, but some proxies reject
+    immediately without auth. This local proxy adds the header proactively.
+    Returns the local port number.
+    """
+    auth_b64 = base64.b64encode(f"{username}:{password}".encode()).decode()
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    local_port = srv.getsockname()[1]
+    srv.listen(20)
+
+    def _relay(src, dst):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except Exception:
+            pass
+        finally:
+            for s in (src, dst):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def _handle(client):
+        try:
+            # Read initial request (e.g. CONNECT host:443 HTTP/1.1\r\n...\r\n\r\n)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = client.recv(4096)
+                if not chunk:
+                    client.close()
+                    return
+                buf += chunk
+
+            # Connect to upstream proxy
+            upstream = socket.create_connection((upstream_host, upstream_port), timeout=15)
+
+            # Inject Proxy-Authorization header before the blank line
+            idx = buf.index(b"\r\n\r\n")
+            patched = (
+                buf[:idx]
+                + f"\r\nProxy-Authorization: Basic {auth_b64}".encode()
+                + buf[idx:]
+            )
+            upstream.sendall(patched)
+
+            if buf.startswith(b"CONNECT"):
+                # Read proxy response (e.g. HTTP/1.1 200 Connection established)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = upstream.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                client.sendall(resp)
+
+                if b" 200 " not in resp.split(b"\r\n")[0]:
+                    client.close()
+                    upstream.close()
+                    return
+
+            # Bidirectional relay
+            t1 = threading.Thread(target=_relay, args=(client, upstream), daemon=True)
+            t2 = threading.Thread(target=_relay, args=(upstream, client), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _accept_loop():
+        while True:
+            try:
+                client, _ = srv.accept()
+                threading.Thread(target=_handle, args=(client,), daemon=True).start()
+            except Exception:
+                break
+
+    threading.Thread(target=_accept_loop, daemon=True).start()
+    logger.info("Local auth proxy started on 127.0.0.1:%d -> %s:%d", local_port, upstream_host, upstream_port)
+    return local_port
+
+
 def _test_proxy_connectivity():
     """Test proxy connectivity before launching browser."""
-    import socket
     import urllib.request
 
     if not PROXY_SERVER and not PROXY_URL:
@@ -204,25 +300,24 @@ async def _do_login() -> dict:
                 "--disable-renderer-backgrounding",
             ],
         )
-        # Configure proxy — set on launch level for CONNECT tunnel support
+        # Configure proxy via local auth-injecting forwarder
+        # Chromium doesn't send Proxy-Authorization proactively — some proxies
+        # reject without a 407 challenge. Our local proxy fixes this.
         if PROXY_SERVER:
-            server = PROXY_SERVER if "://" in PROXY_SERVER else f"http://{PROXY_SERVER}"
-            proxy_conf = {"server": server}
-            if PROXY_USER:
-                proxy_conf["username"] = PROXY_USER
-            if PROXY_PASS:
-                proxy_conf["password"] = PROXY_PASS
-            launch_opts["proxy"] = proxy_conf
-            logger.info("Using proxy: %s (user: %s)", server, PROXY_USER or "none")
+            host = PROXY_SERVER.split("://")[-1].split(":")[0]
+            port_str = PROXY_SERVER.split(":")[-1]
+            port = int(port_str) if port_str.isdigit() else 20004
+            local_port = _start_auth_proxy(host, port, PROXY_USER, PROXY_PASS)
+            launch_opts["proxy"] = {"server": f"http://127.0.0.1:{local_port}"}
+            logger.info("Proxy via local forwarder :%d -> %s:%d (user: %s)", local_port, host, port, PROXY_USER or "none")
         elif PROXY_URL:
             parsed = urlparse(PROXY_URL)
-            proxy_conf = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-            if parsed.username:
-                proxy_conf["username"] = parsed.username
-            if parsed.password:
-                proxy_conf["password"] = parsed.password
-            launch_opts["proxy"] = proxy_conf
-            logger.info("Using proxy: %s:%s", parsed.hostname, parsed.port)
+            local_port = _start_auth_proxy(
+                parsed.hostname, parsed.port or 20004,
+                parsed.username or "", parsed.password or "",
+            )
+            launch_opts["proxy"] = {"server": f"http://127.0.0.1:{local_port}"}
+            logger.info("Proxy via local forwarder :%d -> %s:%s", local_port, parsed.hostname, parsed.port)
         browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
