@@ -26,6 +26,10 @@ VFS_LOGIN_URL = "https://visa.vfsglobal.com/are/en/prt/login"
 VFS_EMAIL = os.environ.get("VFS_EMAIL", "")
 VFS_PASSWORD = os.environ.get("VFS_PASSWORD", "")
 PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. http://user:pass@host:port
+# Or use separate env vars (takes priority if PROXY_SERVER is set):
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "")   # e.g. ae.decodo.com:20001
+PROXY_USER = os.environ.get("PROXY_USER", "")
+PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
 logger = logging.getLogger("auto_login")
 
@@ -148,7 +152,17 @@ async def _do_login() -> dict:
                 "--disable-renderer-backgrounding",
             ],
         )
-        if PROXY_URL:
+        # Configure proxy — prefer separate env vars, fall back to URL parsing
+        if PROXY_SERVER:
+            server = PROXY_SERVER if "://" in PROXY_SERVER else f"http://{PROXY_SERVER}"
+            proxy_conf = {"server": server}
+            if PROXY_USER:
+                proxy_conf["username"] = PROXY_USER
+            if PROXY_PASS:
+                proxy_conf["password"] = PROXY_PASS
+            launch_opts["proxy"] = proxy_conf
+            logger.info("Using proxy: %s (user: %s)", server, PROXY_USER or "none")
+        elif PROXY_URL:
             parsed = urlparse(PROXY_URL)
             proxy_conf = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
             if parsed.username:
