@@ -133,10 +133,52 @@ async def _log_page_debug(page, label="debug"):
         logger.warning("[%s] Could not capture debug info: %s", label, e)
 
 
+def _test_proxy_connectivity():
+    """Test proxy connectivity before launching browser."""
+    import socket
+    import urllib.request
+
+    if not PROXY_SERVER and not PROXY_URL:
+        return
+
+    host = PROXY_SERVER.split("://")[-1].split(":")[0] if PROXY_SERVER else ""
+    port_str = PROXY_SERVER.split(":")[-1] if PROXY_SERVER else ""
+    if not host:
+        return
+
+    port = int(port_str) if port_str.isdigit() else 20004
+
+    # Test 1: TCP connectivity
+    logger.info("Testing TCP connectivity to %s:%d ...", host, port)
+    try:
+        sock = socket.create_connection((host, port), timeout=10)
+        sock.close()
+        logger.info("TCP connection to %s:%d OK", host, port)
+    except Exception as e:
+        logger.error("TCP connection to %s:%d FAILED: %s", host, port, e)
+        return
+
+    # Test 2: HTTP request through proxy
+    logger.info("Testing HTTP request through proxy...")
+    try:
+        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{host}:{port}" if PROXY_USER else f"http://{host}:{port}"
+        proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        opener = urllib.request.build_opener(proxy_handler)
+        req = urllib.request.Request("http://httpbin.org/ip", headers={"User-Agent": "Mozilla/5.0"})
+        resp = opener.open(req, timeout=15)
+        body = resp.read().decode()
+        logger.info("Proxy HTTP test OK — response: %s", body.strip())
+    except Exception as e:
+        logger.warning("Proxy HTTP test failed: %s", e)
+
+
 async def _do_login() -> dict:
     """Perform a single login attempt. Returns session dict."""
     if not VFS_EMAIL or not VFS_PASSWORD:
         raise RuntimeError("VFS_EMAIL and VFS_PASSWORD environment variables required")
+
+    # Test proxy connectivity before launching browser
+    _test_proxy_connectivity()
 
     captured_headers = {}
 
