@@ -11,6 +11,7 @@ Handles the full login flow:
 """
 
 import asyncio
+import base64
 import logging
 import os
 from datetime import datetime
@@ -97,6 +98,35 @@ async def _inject_turnstile_token(page, token: str):
     logger.info("Turnstile token injected")
 
 
+async def _log_page_debug(page, label="debug"):
+    """Log page state for remote debugging."""
+    try:
+        url = page.url
+        title = await page.title()
+        logger.info("[%s] URL: %s | Title: %s", label, url, title)
+
+        # Log a truncated base64 screenshot so we can decode it from Railway logs
+        screenshot = await page.screenshot(type="png")
+        b64 = base64.b64encode(screenshot).decode()
+        # Log first 500 chars — enough to decode and inspect a small thumbnail
+        logger.info("[%s] Screenshot (base64, first 500 chars): %s", label, b64[:500])
+
+        # Log page HTML structure (just body tag children)
+        structure = await page.evaluate("""
+            () => {
+                const body = document.body;
+                if (!body) return 'no body';
+                const tags = Array.from(body.children).map(
+                    el => `<${el.tagName.toLowerCase()} id="${el.id}" class="${el.className}">`
+                );
+                return tags.join('\\n');
+            }
+        """)
+        logger.info("[%s] Page structure:\n%s", label, structure)
+    except Exception as e:
+        logger.warning("[%s] Could not capture debug info: %s", label, e)
+
+
 async def _do_login() -> dict:
     """Perform a single login attempt. Returns session dict."""
     if not VFS_EMAIL or not VFS_PASSWORD:
@@ -144,6 +174,39 @@ async def _do_login() -> dict:
             await page.goto(VFS_LOGIN_URL, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(3000)
 
+            # Debug: log page state after initial load
+            page_title = await page.title()
+            logger.info("Page loaded — URL: %s | Title: %s", page.url, page_title)
+
+            # Check if we're on a Cloudflare challenge page
+            if "just a moment" in page_title.lower() or "cloudflare" in page_title.lower():
+                logger.warning("Cloudflare challenge page detected — waiting longer...")
+                await page.wait_for_timeout(10000)
+                page_title = await page.title()
+                logger.info("After wait — URL: %s | Title: %s", page.url, page_title)
+
+            # Dismiss cookie consent banner (OneTrust)
+            # VFS uses OneTrust — the banner blocks form interaction
+            logger.info("Checking for cookie consent banner...")
+            try:
+                reject_btn = page.get_by_role("button", name="Reject All")
+                if await reject_btn.is_visible(timeout=5000):
+                    await reject_btn.click()
+                    logger.info("Cookie banner dismissed (Reject All)")
+                    await page.wait_for_timeout(1000)
+            except Exception:
+                # Also try OneTrust-specific selectors
+                for sel in ["#onetrust-reject-all-handler", "#onetrust-accept-btn-handler"]:
+                    try:
+                        btn = page.locator(sel)
+                        if await btn.is_visible(timeout=2000):
+                            await btn.click()
+                            logger.info("Cookie banner dismissed via %s", sel)
+                            await page.wait_for_timeout(1000)
+                            break
+                    except Exception:
+                        continue
+
             # Solve Turnstile
             try:
                 sitekey = await _extract_turnstile_sitekey(page)
@@ -154,10 +217,12 @@ async def _do_login() -> dict:
                 logger.warning("Turnstile solving failed: %s — trying to proceed anyway", e)
 
             # Fill credentials
+            # VFS uses Angular Material — inputs are #mat-input-0 (email), #mat-input-1 (password)
             logger.info("Filling login credentials...")
 
-            # Try multiple selector patterns for email
+            # Try Angular Material selectors first, then generic fallbacks
             email_selectors = [
+                "#mat-input-0",
                 'input[type="email"]',
                 'input[name="email"]',
                 'input[placeholder*="mail"]',
@@ -166,8 +231,9 @@ async def _do_login() -> dict:
             email_filled = False
             for sel in email_selectors:
                 try:
-                    await page.wait_for_selector(sel, timeout=5000)
-                    await page.fill(sel, VFS_EMAIL)
+                    locator = page.locator(sel)
+                    await locator.wait_for(timeout=5000)
+                    await locator.fill(VFS_EMAIL)
                     email_filled = True
                     logger.info("Email filled using selector: %s", sel)
                     break
@@ -175,10 +241,23 @@ async def _do_login() -> dict:
                     continue
 
             if not email_filled:
+                # Debug: log what inputs are on the page
+                input_info = await page.evaluate("""
+                    () => {
+                        const inputs = document.querySelectorAll('input');
+                        return Array.from(inputs).map(i => ({
+                            id: i.id, name: i.name, type: i.type,
+                            placeholder: i.placeholder, class: i.className
+                        }));
+                    }
+                """)
+                logger.error("Available inputs on page: %s", input_info)
+                await _log_page_debug(page, "email-not-found")
                 raise RuntimeError("Could not find email input field")
 
             # Fill password
             password_selectors = [
+                "#mat-input-1",
                 'input[type="password"]',
                 'input[name="password"]',
                 'input[id*="password"]',
@@ -186,7 +265,8 @@ async def _do_login() -> dict:
             password_filled = False
             for sel in password_selectors:
                 try:
-                    await page.fill(sel, VFS_PASSWORD)
+                    locator = page.locator(sel)
+                    await locator.fill(VFS_PASSWORD)
                     password_filled = True
                     logger.info("Password filled using selector: %s", sel)
                     break
@@ -196,38 +276,48 @@ async def _do_login() -> dict:
             if not password_filled:
                 raise RuntimeError("Could not find password input field")
 
-            # Click sign in
-            submit_selectors = [
-                'button[type="submit"]',
-                'button:has-text("Sign In")',
-                'button:has-text("Login")',
-                'button:has-text("Log In")',
-                '.btn-sign-in',
-            ]
-            submitted = False
-            for sel in submit_selectors:
-                try:
-                    await page.click(sel, timeout=5000)
-                    submitted = True
-                    logger.info("Clicked submit using selector: %s", sel)
-                    break
-                except Exception:
-                    continue
+            # Click sign in — VFS uses role=button "Sign In"
+            sign_in_btn = page.get_by_role("button", name="Sign In")
+            try:
+                await sign_in_btn.click(timeout=5000)
+                logger.info("Clicked Sign In button")
+            except Exception:
+                # Fallback to other selectors
+                submit_selectors = [
+                    'button[type="submit"]',
+                    'button:has-text("Sign In")',
+                    'button:has-text("Login")',
+                    'button:has-text("Log In")',
+                ]
+                submitted = False
+                for sel in submit_selectors:
+                    try:
+                        await page.click(sel, timeout=5000)
+                        submitted = True
+                        logger.info("Clicked submit using selector: %s", sel)
+                        break
+                    except Exception:
+                        continue
+                if not submitted:
+                    raise RuntimeError("Could not find submit button")
 
-            if not submitted:
-                raise RuntimeError("Could not find submit button")
-
-            # Wait for dashboard
-            logger.info("Waiting for dashboard...")
+            # Wait for post-login page (dashboard or "Start New Booking" button)
+            logger.info("Waiting for post-login page...")
             try:
                 await page.wait_for_url("**/dashboard", timeout=30000)
                 logger.info("Dashboard loaded — login successful!")
             except Exception:
-                current_url = page.url
-                logger.warning("Did not reach dashboard. Current URL: %s", current_url)
-                # Try to continue anyway — maybe the URL pattern is different
-                if "login" in current_url:
-                    raise RuntimeError(f"Still on login page: {current_url}")
+                # VFS might show "Start New Booking" instead of redirecting to /dashboard
+                try:
+                    start_booking = page.get_by_role("button", name="Start New Booking")
+                    await start_booking.wait_for(timeout=10000)
+                    logger.info("Post-login page loaded (Start New Booking visible)")
+                except Exception:
+                    current_url = page.url
+                    logger.warning("Did not reach dashboard. Current URL: %s", current_url)
+                    await _log_page_debug(page, "post-login-fail")
+                    if "login" in current_url:
+                        raise RuntimeError(f"Still on login page: {current_url}")
 
             await page.wait_for_timeout(3000)
 
