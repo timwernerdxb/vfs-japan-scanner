@@ -171,6 +171,16 @@ def _test_proxy_connectivity():
     except Exception as e:
         logger.warning("Proxy HTTP test failed: %s", e)
 
+    # Test 3: HTTPS request through proxy (CONNECT tunnel)
+    logger.info("Testing HTTPS CONNECT tunnel through proxy...")
+    try:
+        req_https = urllib.request.Request("https://httpbin.org/ip", headers={"User-Agent": "Mozilla/5.0"})
+        resp_https = opener.open(req_https, timeout=15)
+        body_https = resp_https.read().decode()
+        logger.info("Proxy HTTPS tunnel OK — response: %s", body_https.strip())
+    except Exception as e:
+        logger.warning("Proxy HTTPS tunnel FAILED: %s", e)
+
 
 async def _do_login() -> dict:
     """Perform a single login attempt. Returns session dict."""
@@ -194,8 +204,7 @@ async def _do_login() -> dict:
                 "--disable-renderer-backgrounding",
             ],
         )
-        # Configure proxy — set on context level for proper auth handling
-        proxy_conf = None
+        # Configure proxy — set on launch level for CONNECT tunnel support
         if PROXY_SERVER:
             server = PROXY_SERVER if "://" in PROXY_SERVER else f"http://{PROXY_SERVER}"
             proxy_conf = {"server": server}
@@ -203,6 +212,7 @@ async def _do_login() -> dict:
                 proxy_conf["username"] = PROXY_USER
             if PROXY_PASS:
                 proxy_conf["password"] = PROXY_PASS
+            launch_opts["proxy"] = proxy_conf
             logger.info("Using proxy: %s (user: %s)", server, PROXY_USER or "none")
         elif PROXY_URL:
             parsed = urlparse(PROXY_URL)
@@ -211,9 +221,10 @@ async def _do_login() -> dict:
                 proxy_conf["username"] = parsed.username
             if parsed.password:
                 proxy_conf["password"] = parsed.password
+            launch_opts["proxy"] = proxy_conf
             logger.info("Using proxy: %s:%s", parsed.hostname, parsed.port)
         browser = await p.chromium.launch(**launch_opts)
-        context_opts = dict(
+        context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -222,9 +233,6 @@ async def _do_login() -> dict:
             locale="en-US",
             timezone_id="Asia/Dubai",
         )
-        if proxy_conf:
-            context_opts["proxy"] = proxy_conf
-        context = await browser.new_context(**context_opts)
         page = await context.new_page()
 
         # Comprehensive anti-detection stealth patches
