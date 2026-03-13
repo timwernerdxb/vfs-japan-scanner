@@ -178,8 +178,12 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                     return
                 buf += chunk
 
+            first_line = buf.split(b"\r\n")[0].decode(errors="replace")
+            logger.info("[local-proxy] Received: %s", first_line)
+
             # Connect to upstream proxy
             upstream = socket.create_connection((upstream_host, upstream_port), timeout=15)
+            logger.info("[local-proxy] Connected to upstream %s:%d", upstream_host, upstream_port)
 
             # Inject Proxy-Authorization header before the blank line
             idx = buf.index(b"\r\n\r\n")
@@ -198,9 +202,12 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                     if not chunk:
                         break
                     resp += chunk
+                resp_line = resp.split(b"\r\n")[0].decode(errors="replace")
+                logger.info("[local-proxy] Upstream response: %s", resp_line)
                 client.sendall(resp)
 
                 if b" 200 " not in resp.split(b"\r\n")[0]:
+                    logger.warning("[local-proxy] Tunnel rejected: %s", resp_line)
                     client.close()
                     upstream.close()
                     return
@@ -211,7 +218,8 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
             t1.start()
             t2.start()
             t1.join()
-        except Exception:
+        except Exception as e:
+            logger.warning("[local-proxy] Handler error: %s", e)
             try:
                 client.close()
             except Exception:
