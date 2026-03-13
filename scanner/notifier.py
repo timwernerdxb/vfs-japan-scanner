@@ -1,62 +1,82 @@
 """
-WhatsApp notification via CallMeBot.
+Email notification via Resend.
 
-Free API - get your API key at:
-https://www.callmebot.com/blog/free-api-whatsapp-messages/
+Get an API key at: https://resend.com/
 """
 
+import json
 import os
-import urllib.request
-import urllib.parse
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
-WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "")
-CALLMEBOT_API_KEY = os.environ.get("CALLMEBOT_API_KEY", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+NOTIFY_FROM = os.environ.get("NOTIFY_FROM", "VFS Scanner <notifications@resend.dev>")
+NOTIFY_TO = os.environ.get("NOTIFY_TO", "")
 
 
-def send_whatsapp(message: str) -> bool:
-    """Send a WhatsApp notification via CallMeBot."""
-    if not WHATSAPP_NUMBER or not CALLMEBOT_API_KEY:
-        print("[NOTIFY] Missing WHATSAPP_NUMBER or CALLMEBOT_API_KEY")
+def send_notification(message: str, subject: str = None) -> bool:
+    """Send an email notification via Resend."""
+    if not RESEND_API_KEY or not NOTIFY_TO:
+        print("[NOTIFY] Missing RESEND_API_KEY or NOTIFY_TO")
         return False
 
-    print(f"[NOTIFY] Sending via CallMeBot: {message[:100]}...")
+    if not subject:
+        if "SLOTS FOUND" in message.upper() or "AVAILABLE" in message.upper():
+            subject = "VFS Portugal: Slots Available!"
+        else:
+            subject = "VFS Portugal Visa Slot Update"
+
+    print(f"[NOTIFY] Sending email to {NOTIFY_TO}: {subject}")
+
+    body = json.dumps({
+        "from": NOTIFY_FROM,
+        "to": [addr.strip() for addr in NOTIFY_TO.split(",")],
+        "subject": subject,
+        "html": message.replace("\n", "<br>"),
+    }).encode("utf-8")
+
+    req = Request(
+        "https://api.resend.com/emails",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
 
     try:
-        encoded_msg = urllib.parse.quote(message)
-        url = (
-            f"https://api.callmebot.com/whatsapp.php"
-            f"?phone={WHATSAPP_NUMBER}"
-            f"&text={encoded_msg}"
-            f"&apikey={CALLMEBOT_API_KEY}"
-        )
-
-        req = urllib.request.Request(url, method="GET")
-        resp = urllib.request.urlopen(req, timeout=15)
-        print(f"[NOTIFY] CallMeBot response: {resp.status}")
+        resp = urlopen(req, timeout=15)
+        print(f"[NOTIFY] Resend response: {resp.status}")
         return resp.status == 200
-    except Exception as e:
+    except URLError as e:
         print(f"[NOTIFY] Error: {e}")
         return False
 
 
 def format_results(results: list) -> str:
-    """Format checker results into a WhatsApp message."""
-    lines = ["🇯🇵 *VFS Japan Visa Slot Update*\n"]
+    """Format checker results into a notification message."""
+    lines = ["<h3>VFS Portugal Visa Slot Update</h3>"]
 
     has_availability = False
     for r in results:
-        if r["available"]:
+        if r.get("error"):
+            lines.append(f"<p>&#9888;&#65039; {r['centre']}: {r['message']}</p>")
+        elif r["available"]:
             has_availability = True
             lines.append(
-                f"✅ *{r['centre']}*\n"
-                f"   Earliest slot: *{r['earliest_date']}*"
+                f"<p><strong>&#9989; {r['centre']}</strong><br>"
+                f"Earliest slot: <strong>{r['earliest_date']}</strong></p>"
             )
         else:
-            lines.append(f"❌ {r['centre']}: No slots")
+            lines.append(f"<p>&#10060; {r['centre']}: No slots</p>")
 
-    lines.append(f"\n🕐 Checked: {results[0]['checked_at'][:19]}")
+    lines.append(f"<p><small>Checked: {results[0]['checked_at'][:19]}</small></p>")
 
     if has_availability:
-        lines.append("\n⚡ Book now at: https://visa.vfsglobal.com/are/en/jpn/login")
+        lines.append(
+            '<p><a href="https://visa.vfsglobal.com/are/en/prt/login">'
+            "Book now at VFS</a></p>"
+        )
 
     return "\n".join(lines)

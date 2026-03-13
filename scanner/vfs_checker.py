@@ -1,8 +1,8 @@
 """
-VFS Japan Visa Appointment Slot Checker
+VFS Portugal Visa Appointment Slot Checker
 
-Uses direct API calls with cookies/token from a browser session.
-Run refresh_token.py first to capture a valid session.
+Uses direct API calls with session tokens (JWT + cookies).
+Tokens are obtained automatically via auto_login.
 """
 
 import json
@@ -19,13 +19,21 @@ API_URL = "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable"
 # Centres to check
 CENTRES = [
     {
-        "name": "Japan Visa Application Centre, Dubai",
+        "name": "Portugal Visa Application Centre, Dubai",
         "vacCode": "DXB",
     },
 ]
 
-VISA_CATEGORY_CODE = "JUSV7"
+VISA_CATEGORY_CODE = os.environ.get("VFS_VISA_CATEGORY", "STOV")
 LOGIN_USER = os.environ.get("VFS_EMAIL", "")
+
+
+def is_session_valid(session):
+    """Test if a session is still valid by making a real API call."""
+    if not session or not session.get("authorize"):
+        return False
+    result = check_slot(session, CENTRES[0])
+    return not result.get("error")
 
 
 def load_session():
@@ -51,6 +59,7 @@ def check_slot(session, centre):
         "available": False,
         "earliest_date": None,
         "message": None,
+        "error": False,
         "checked_at": datetime.now().isoformat(),
     }
 
@@ -62,7 +71,7 @@ def check_slot(session, centre):
 
     body = json.dumps({
         "countryCode": "are",
-        "missionCode": "jpn",
+        "missionCode": "prt",
         "vacCode": vac_code,
         "visaCategoryCode": VISA_CATEGORY_CODE,
         "roleName": "Individual",
@@ -76,7 +85,7 @@ def check_slot(session, centre):
         "content-type": "application/json;charset=UTF-8",
         "origin": "https://visa.vfsglobal.com",
         "referer": "https://visa.vfsglobal.com/",
-        "route": "are/en/jpn",
+        "route": "are/en/prt",
         "user-agent": session.get("user_agent",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -136,18 +145,20 @@ def check_slot(session, centre):
             print(f"[CHECK] {centre_name}: Unknown response format")
 
     except HTTPError as e:
+        result["error"] = True
         error_body = e.read().decode("utf-8")[:500]
         if e.code == 401:
-            result["message"] = "Session expired - run refresh_token.py"
+            result["message"] = "⚠️ Session expired - refresh token needed"
             print(f"[ERROR] 401 Unauthorized - token expired")
         elif e.code == 403:
-            result["message"] = "Blocked by Cloudflare - run refresh_token.py"
+            result["message"] = "⚠️ Session expired - refresh token needed"
             print(f"[ERROR] 403 Forbidden - Cloudflare block")
         else:
-            result["message"] = f"HTTP {e.code}: {error_body}"
+            result["message"] = f"⚠️ HTTP {e.code}: {error_body}"
             print(f"[ERROR] HTTP {e.code}: {error_body}")
     except URLError as e:
-        result["message"] = f"Network error: {e.reason}"
+        result["error"] = True
+        result["message"] = f"⚠️ Network error: {e.reason}"
         print(f"[ERROR] {e.reason}")
 
     return result

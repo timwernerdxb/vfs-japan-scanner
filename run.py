@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VFS Japan Visa Appointment Slot Checker
+VFS Portugal Visa Appointment Slot Checker
 
 Checks for available appointment slots at configured VFS centres
 and sends WhatsApp notifications when slots are found.
@@ -15,7 +15,7 @@ import asyncio
 import sys
 
 from scanner.vfs_checker import main as check_slots
-from scanner.notifier import send_whatsapp, format_results
+from scanner.notifier import send_notification, format_results
 
 
 async def run():
@@ -23,7 +23,7 @@ async def run():
     dry_run = "--dry-run" in sys.argv
 
     print("=" * 60)
-    print("VFS Japan Visa Slot Checker")
+    print("VFS Portugal Visa Slot Checker")
     print("=" * 60)
 
     # Run the checker
@@ -33,21 +33,29 @@ async def run():
         print("\n[WARN] No results returned")
         return
 
-    # Check if any slots are available
+    # Check results
     has_availability = any(r["available"] for r in results)
+    all_errors = all(r.get("error") for r in results)
 
     if has_availability:
         print("\n🎉 SLOTS FOUND! Sending notification...")
+    elif all_errors:
+        print("\n⚠️ All checks failed (token expired?). Skipping notification.")
     else:
         print("\nNo slots available at any centre.")
 
-    # Send notification
+    # Send notification:
+    # - Always notify on slots found
+    # - On --always-notify, only if check actually succeeded (not just errors)
+    # - Skip if all results are errors (misleading "no slots")
+    should_notify = has_availability or (always_notify and not all_errors)
+
     if dry_run:
         message = format_results(results)
         print(f"\n[DRY RUN] Would send:\n{message}")
-    elif has_availability or always_notify:
+    elif should_notify:
         message = format_results(results)
-        success = send_whatsapp(message)
+        success = send_notification(message)
         if success:
             print("[OK] Notification sent!")
         else:
