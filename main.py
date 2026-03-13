@@ -20,6 +20,7 @@ from scanner.vfs_checker import check_slot, is_session_valid, CENTRES
 from scanner.notifier import send_notification, format_results
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_MINUTES", "20")) * 60
+NOTIFY_ALWAYS = os.environ.get("NOTIFY_ALWAYS", "").lower() in ("1", "true", "yes")
 MAX_CONSECUTIVE_ERRORS = 5
 
 logging.basicConfig(
@@ -100,8 +101,11 @@ async def main():
         has_availability = any(r["available"] for r in results)
         all_errors = all(r.get("error") for r in results)
 
-        if has_availability:
-            logger.info("SLOTS FOUND! Sending notification...")
+        should_notify = has_availability or (NOTIFY_ALWAYS and not all_errors)
+
+        if should_notify:
+            label = "SLOTS FOUND!" if has_availability else "Status update"
+            logger.info("%s Sending notification...", label)
             message = format_results(results)
             success = send_notification(message)
             if success:
