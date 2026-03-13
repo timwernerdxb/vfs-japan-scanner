@@ -152,7 +152,8 @@ async def _do_login() -> dict:
                 "--disable-renderer-backgrounding",
             ],
         )
-        # Configure proxy — prefer separate env vars, fall back to URL parsing
+        # Configure proxy — set on context level for proper auth handling
+        proxy_conf = None
         if PROXY_SERVER:
             server = PROXY_SERVER if "://" in PROXY_SERVER else f"http://{PROXY_SERVER}"
             proxy_conf = {"server": server}
@@ -160,7 +161,6 @@ async def _do_login() -> dict:
                 proxy_conf["username"] = PROXY_USER
             if PROXY_PASS:
                 proxy_conf["password"] = PROXY_PASS
-            launch_opts["proxy"] = proxy_conf
             logger.info("Using proxy: %s (user: %s)", server, PROXY_USER or "none")
         elif PROXY_URL:
             parsed = urlparse(PROXY_URL)
@@ -169,10 +169,9 @@ async def _do_login() -> dict:
                 proxy_conf["username"] = parsed.username
             if parsed.password:
                 proxy_conf["password"] = parsed.password
-            launch_opts["proxy"] = proxy_conf
             logger.info("Using proxy: %s:%s", parsed.hostname, parsed.port)
         browser = await p.chromium.launch(**launch_opts)
-        context = await browser.new_context(
+        context_opts = dict(
             viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -181,6 +180,9 @@ async def _do_login() -> dict:
             locale="en-US",
             timezone_id="Asia/Dubai",
         )
+        if proxy_conf:
+            context_opts["proxy"] = proxy_conf
+        context = await browser.new_context(**context_opts)
         page = await context.new_page()
 
         # Comprehensive anti-detection stealth patches
