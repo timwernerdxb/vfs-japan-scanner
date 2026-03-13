@@ -27,6 +27,7 @@ VFS_LOGIN_URL = "https://visa.vfsglobal.com/are/en/prt/login"
 
 VFS_EMAIL = os.environ.get("VFS_EMAIL", "")
 VFS_PASSWORD = os.environ.get("VFS_PASSWORD", "")
+PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "OFF").upper() == "ON"
 PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. http://user:pass@host:port
 # Or use separate env vars (takes priority if PROXY_SERVER is set):
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "")   # e.g. ae.decodo.com:20001
@@ -242,7 +243,7 @@ def _test_proxy_connectivity():
     """Test proxy connectivity before launching browser."""
     import urllib.request
 
-    if not PROXY_SERVER and not PROXY_URL:
+    if not PROXY_ENABLED or (not PROXY_SERVER and not PROXY_URL):
         return
 
     host = PROXY_SERVER.split("://")[-1].split(":")[0] if PROXY_SERVER else ""
@@ -311,14 +312,14 @@ async def _do_login() -> dict:
         # Configure proxy via local auth-injecting forwarder
         # Chromium doesn't send Proxy-Authorization proactively — some proxies
         # reject without a 407 challenge. Our local proxy fixes this.
-        if PROXY_SERVER:
+        if PROXY_ENABLED and PROXY_SERVER:
             host = PROXY_SERVER.split("://")[-1].split(":")[0]
             port_str = PROXY_SERVER.split(":")[-1]
             port = int(port_str) if port_str.isdigit() else 20004
             local_port = _start_auth_proxy(host, port, PROXY_USER, PROXY_PASS)
             launch_opts["proxy"] = {"server": f"http://127.0.0.1:{local_port}"}
             logger.info("Proxy via local forwarder :%d -> %s:%d (user: %s)", local_port, host, port, PROXY_USER or "none")
-        elif PROXY_URL:
+        elif PROXY_ENABLED and PROXY_URL:
             parsed = urlparse(PROXY_URL)
             local_port = _start_auth_proxy(
                 parsed.hostname, parsed.port or 20004,
