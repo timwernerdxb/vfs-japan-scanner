@@ -642,6 +642,61 @@ async def _do_login() -> dict:
                     }
                 };
 
+                // ── SCRIPT.ONLOAD SETTER INTERCEPTOR ──
+                // Angular may use `script.onload = handler` instead of addEventListener.
+                // If the script already loaded, onload never fires.
+                // FIX: intercept onload setter — if script is in DOM with src
+                // (meaning it was in the original HTML and already loaded), fire
+                // the handler immediately.
+                try {
+                    var _origOnloadDesc = Object.getOwnPropertyDescriptor(
+                        HTMLElement.prototype, 'onload');
+                    if (_origOnloadDesc && _origOnloadDesc.set) {
+                        _origDefProp.call(Object, HTMLScriptElement.prototype, 'onload', {
+                            set: function(fn) {
+                                // Set normally using original descriptor
+                                _origOnloadDesc.set.call(this, fn);
+
+                                if (fn && typeof fn === 'function') {
+                                    var id = this.id || '';
+                                    var src = (this.src || '').substring(0, 80);
+                                    console.log('ONLOAD_SET id=' + id + ' src=' + src);
+
+                                    // Check if script already loaded
+                                    var loaded = _loadedScripts.has(this);
+                                    // Fallback: script is in DOM with src = pre-existing = already loaded
+                                    if (!loaded && this.src && this.parentNode) {
+                                        loaded = true;
+                                        _loadedScripts.add(this);
+                                    }
+
+                                    if (loaded) {
+                                        console.log('ONLOAD_LATE id=' + id + ' src=' + src);
+                                        var el = this;
+                                        setTimeout(function() {
+                                            try {
+                                                fn.call(el, new Event('load'));
+                                                console.log('ONLOAD_FIRED id=' + id);
+                                            } catch(e) {
+                                                console.log('ONLOAD_ERR:' + e.message);
+                                            }
+                                        }, 0);
+                                    }
+                                }
+                            },
+                            get: function() {
+                                if (_origOnloadDesc.get) return _origOnloadDesc.get.call(this);
+                                return null;
+                            },
+                            configurable: true,
+                            enumerable: true
+                        });
+                        console.log('INIT_ONLOAD_INTERCEPT_OK');
+                    } else {
+                        console.log('INIT_ONLOAD_NO_DESC');
+                    }
+                } catch(e) { console.log('INIT_ONLOAD_FAIL:' + e.message); }
+
                 // MutationObserver for logging script additions
                 var _obs = new MutationObserver(function(mutations) {
                     for (var mi = 0; mi < mutations.length; mi++) {
@@ -660,26 +715,110 @@ async def _do_login() -> dict:
                 });
                 _obs.observe(document.documentElement, {childList: true, subtree: true});
 
-                // Periodic fallback: dispatch 'load' on volt-recaptcha every 5s
-                // until callback is captured (handles edge cases where the capture-
-                // phase tracking missed the load event)
+                // Periodic fallback: dispatch 'load' on turnstile-related scripts +
+                // proactively call turnstile.render() if no callback after 5s
                 var _renderRetry = setInterval(function() {
                     if (window.__turnstileCallback) {
                         clearInterval(_renderRetry);
                         console.log('RENDER_RETRY_DONE: callback captured');
                         return;
                     }
-                    var volt = document.getElementById('volt-recaptcha');
-                    if (volt) {
-                        _loadedScripts.add(volt); // ensure it's tracked
-                        volt.dispatchEvent(new Event('load'));
-                        console.log('RENDER_RETRY: dispatched load on volt-recaptcha');
+
+                    // Try dispatching load on any turnstile/captcha script
+                    var scripts = document.querySelectorAll('script[src]');
+                    for (var si = 0; si < scripts.length; si++) {
+                        var s = scripts[si];
+                        if (s.src.indexOf('challenges.cloudflare.com') >= 0 ||
+                            s.src.indexOf('turnstile') >= 0 ||
+                            s.id === 'volt-recaptcha') {
+                            _loadedScripts.add(s);
+                            s.dispatchEvent(new Event('load'));
+                            console.log('RENDER_RETRY_LOAD id=' + (s.id||'') +
+                                        ' src=' + s.src.substring(0,80));
+                        }
+                    }
+
+                    // Also proactively call turnstile.render() if available
+                    // Find any captcha container on the page
+                    var containers = document.querySelectorAll(
+                        '.cf-turnstile, [data-sitekey], [data-callback], ' +
+                        'volt-recaptcha, app-volt-recaptcha, ngx-turnstile, ' +
+                        're-captcha, app-captcha, lib-captcha');
+                    if (containers.length > 0 && window.turnstile && window.turnstile.render) {
+                        for (var ci = 0; ci < containers.length; ci++) {
+                            var c = containers[ci];
+                            var sk = c.getAttribute('data-sitekey') ||
+                                     window.__capturedTurnstileSitekey || '';
+                            var cbName = c.getAttribute('data-callback');
+                            console.log('RENDER_RETRY_CONTAINER tag=' + c.tagName +
+                                        ' sitekey=' + sk.substring(0,20) +
+                                        ' data-cb=' + (cbName||''));
+
+                            // If there's a data-callback, call the global function directly
+                            if (cbName && typeof window[cbName] === 'function' &&
+                                window.__captchaToken) {
+                                try {
+                                    window[cbName](window.__captchaToken);
+                                    console.log('RENDER_RETRY_GLOBAL_CB:' + cbName);
+                                } catch(e) {
+                                    console.log('RENDER_RETRY_GLOBAL_ERR:' + e.message);
+                                }
+                            }
+
+                            // Also try calling render() with this container
+                            try {
+                                window.turnstile.render(c, {
+                                    sitekey: sk || '0x4AAAAAABhlz7Ei4byodYjs',
+                                    callback: function(token) {
+                                        console.log('RENDER_RETRY_CB_INVOKED len=' +
+                                                    (token||'').length);
+                                    }
+                                });
+                            } catch(e) {}
+                        }
                     }
                 }, 5000);
                 setTimeout(function() { clearInterval(_renderRetry); }, 120000);
 
                 console.log('INIT_SCRIPT_INTERCEPT_OK');
             } catch(e) { console.log('INIT_SCRIPT_INTERCEPT_FAIL:' + e.message); }
+
+            // ── FETCH INTERCEPTOR ──
+            // Angular HttpClient may use fetch() instead of XMLHttpRequest.
+            // Intercept login POSTs and inject captcha token.
+            try {
+                var _origFetch = window.fetch;
+                window.fetch = function(input, init) {
+                    var url = typeof input === 'string' ? input : (input && input.url || '');
+                    if (url.indexOf('lift-api.vfsglobal.com') >= 0 &&
+                        init && init.method === 'POST' && init.body) {
+                        try {
+                            var json = JSON.parse(init.body);
+                            if (json.username || json.password) {
+                                console.log('FETCH_LOGIN url=' + url.substring(0,80) +
+                                            ' keys=' + Object.keys(json).join(','));
+                                var modified = false;
+                                if (window.__captchaToken) {
+                                    if (!json.captcha_api_key || json.captcha_api_key === '') {
+                                        json.captcha_api_key = window.__captchaToken;
+                                        modified = true;
+                                    }
+                                    if (!json.captcha_version) {
+                                        json.captcha_version = 'Turnstile';
+                                        modified = true;
+                                    }
+                                }
+                                if (modified) {
+                                    init = Object.assign({}, init, {body: JSON.stringify(json)});
+                                    console.log('FETCH_CAPTCHA_INJECTED');
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    return _origFetch.apply(this, arguments);
+                };
+                console.log('INIT_FETCH_INTERCEPT_OK');
+            } catch(e) { console.log('INIT_FETCH_INTERCEPT_FAIL:' + e.message); }
         }
         """)
 
@@ -753,10 +892,13 @@ async def _do_login() -> dict:
                 logger.info("[console] %s", text)
             if text.startswith("RENDER_RETRY"):
                 logger.info("[console] %s", text)
-            # Log Object.defineProperty intercept + XHR intercept
-            if text.startswith("ODP_") or text.startswith("XHR_"):
+            # Log Object.defineProperty intercept + XHR/fetch intercept
+            if text.startswith("ODP_") or text.startswith("XHR_") or text.startswith("FETCH_"):
                 logger.info("[console] %s", text)
             if text.startswith("FG_PATCHED") or text.startswith("REINSTALLED_"):
+                logger.info("[console] %s", text)
+            # Log onload interceptor events
+            if text.startswith("ONLOAD_"):
                 logger.info("[console] %s", text)
             # Capture sitekey from Turnstile wrapper or fake render
             if "TS_SITEKEY:" in text:
@@ -1139,6 +1281,134 @@ async def _do_login() -> dict:
                         }
                     """)
                     logger.info("Turnstile health check: %s", ts_health)
+
+                    # ── COMPREHENSIVE DOM DIAGNOSTIC ──
+                    # Dump everything captcha-related to understand the integration
+                    dom_diag = await page.evaluate("""
+                        () => {
+                            var r = {};
+
+                            // All scripts with captcha/turnstile in src or id
+                            r.captchaScripts = [];
+                            var scripts = document.querySelectorAll('script[src]');
+                            for (var i = 0; i < scripts.length; i++) {
+                                var s = scripts[i];
+                                var src = s.src || '';
+                                var id = s.id || '';
+                                if (src.indexOf('turnstile') >= 0 ||
+                                    src.indexOf('challenges.cloudflare.com') >= 0 ||
+                                    src.indexOf('recaptcha') >= 0 ||
+                                    id.indexOf('captcha') >= 0 ||
+                                    id.indexOf('volt') >= 0 ||
+                                    id.indexOf('turnstile') >= 0) {
+                                    r.captchaScripts.push({
+                                        id: id,
+                                        src: src.substring(0, 140),
+                                        inDOM: !!s.parentNode,
+                                        hasOnload: !!s.onload
+                                    });
+                                }
+                            }
+
+                            // Elements with captcha-related tags, classes, or attributes
+                            r.captchaEls = [];
+                            var all = document.querySelectorAll('*');
+                            for (var i = 0; i < all.length; i++) {
+                                var el = all[i];
+                                var tag = el.tagName.toLowerCase();
+                                var cls = el.className || '';
+                                if (typeof cls !== 'string') cls = '';
+                                var hasCaptcha = tag.indexOf('captcha') >= 0 ||
+                                    tag.indexOf('turnstile') >= 0 ||
+                                    tag.indexOf('volt') >= 0 ||
+                                    cls.indexOf('cf-turnstile') >= 0 ||
+                                    cls.indexOf('captcha') >= 0 ||
+                                    el.getAttribute('data-sitekey') ||
+                                    el.getAttribute('data-callback');
+                                if (hasCaptcha) {
+                                    r.captchaEls.push({
+                                        tag: tag,
+                                        id: el.id || '',
+                                        cls: cls.substring(0, 60),
+                                        sitekey: el.getAttribute('data-sitekey') || '',
+                                        dataCb: el.getAttribute('data-callback') || '',
+                                        children: el.children.length,
+                                        html: el.innerHTML.substring(0, 200)
+                                    });
+                                }
+                            }
+
+                            // Custom elements (tags with hyphens, non-mat-)
+                            r.customTags = [];
+                            var seen = {};
+                            for (var i = 0; i < all.length; i++) {
+                                var tag = all[i].tagName.toLowerCase();
+                                if (tag.indexOf('-') >= 0 && !seen[tag]) {
+                                    seen[tag] = true;
+                                    r.customTags.push(tag);
+                                }
+                                if (r.customTags.length >= 20) break;
+                            }
+
+                            // Global captcha-related functions
+                            r.globalFns = [];
+                            try {
+                                var names = Object.getOwnPropertyNames(window);
+                                for (var i = 0; i < names.length; i++) {
+                                    var n = names[i].toLowerCase();
+                                    if ((n.indexOf('captcha') >= 0 ||
+                                         n.indexOf('turnstile') >= 0 ||
+                                         n.indexOf('callback') >= 0 ||
+                                         n.indexOf('recaptcha') >= 0) &&
+                                        typeof window[names[i]] === 'function') {
+                                        r.globalFns.push(names[i]);
+                                    }
+                                }
+                            } catch(e) {}
+
+                            // Iframes (Turnstile renders inside iframes)
+                            r.iframes = [];
+                            var iframes = document.querySelectorAll('iframe');
+                            for (var i = 0; i < iframes.length; i++) {
+                                r.iframes.push({
+                                    src: (iframes[i].src || '').substring(0, 140),
+                                    id: iframes[i].id || '',
+                                    name: iframes[i].name || ''
+                                });
+                            }
+
+                            // Form state
+                            r.forms = [];
+                            var forms = document.querySelectorAll('form');
+                            for (var i = 0; i < forms.length; i++) {
+                                var f = forms[i];
+                                var inputs = f.querySelectorAll('input, select, textarea');
+                                var inputList = [];
+                                for (var j = 0; j < inputs.length; j++) {
+                                    inputList.push({
+                                        tag: inputs[j].tagName.toLowerCase(),
+                                        type: inputs[j].type || '',
+                                        name: inputs[j].name || '',
+                                        fcn: inputs[j].getAttribute('formcontrolname') || '',
+                                        hasValue: !!(inputs[j].value)
+                                    });
+                                }
+                                r.forms.push({
+                                    action: f.action || '',
+                                    method: f.method || '',
+                                    inputs: inputList
+                                });
+                            }
+
+                            return r;
+                        }
+                    """)
+                    logger.info("DOM diagnostic — scripts: %s", dom_diag.get("captchaScripts"))
+                    logger.info("DOM diagnostic — captchaEls: %s", dom_diag.get("captchaEls"))
+                    logger.info("DOM diagnostic — customTags: %s", dom_diag.get("customTags"))
+                    logger.info("DOM diagnostic — globalFns: %s", dom_diag.get("globalFns"))
+                    logger.info("DOM diagnostic — iframes: %s", dom_diag.get("iframes"))
+                    logger.info("DOM diagnostic — forms: %s", dom_diag.get("forms"))
 
                     # ── SET TOKEN + INVOKE CAPTURED CALLBACK ──
                     inject_result = await page.evaluate("""
@@ -1542,9 +1812,9 @@ async def _do_login() -> dict:
                     logger.info("Wait %d/60 — URL: %s | state: %s",
                                 nav_wait + 1, current_url, state)
 
-                # At 30s mark, force-enable + re-click as fallback
-                if nav_wait == 15:
-                    logger.info("30s elapsed — force-enable + re-click fallback")
+                # At 20s mark, force-enable + re-click as fallback
+                if nav_wait == 10:
+                    logger.info("20s elapsed — force-enable + re-click fallback")
                     await page.evaluate("""
                         () => {
                             const allBtns = document.querySelectorAll('button');
@@ -1576,6 +1846,105 @@ async def _do_login() -> dict:
                                 }
                             }
                         """, token)
+
+                # At 40s mark, NUCLEAR FALLBACK — direct login via fetch()
+                # If Angular's form validation blocks the POST, bypass it entirely
+                if nav_wait == 20 and "login" in current_url and token:
+                    logger.info("40s elapsed — NUCLEAR: direct login via fetch()")
+                    nuclear_result = await page.evaluate("""
+                        async (args) => {
+                            var r = {};
+                            var email = args[0];
+                            var captchaToken = args[1];
+
+                            // Read password from form
+                            var pwInput = document.querySelector(
+                                'input[type="password"]');
+                            var password = pwInput ? pwInput.value : '';
+                            r.has_password = !!password;
+
+                            if (!password) {
+                                r.error = 'No password in form';
+                                return r;
+                            }
+
+                            // Find the login API URL from Angular's network requests
+                            // or try common VFS endpoint patterns
+                            var loginUrls = [];
+
+                            // Check if Angular has already tried to make any API calls
+                            // by looking at performance entries
+                            try {
+                                var entries = performance.getEntriesByType('resource');
+                                for (var i = 0; i < entries.length; i++) {
+                                    var e = entries[i];
+                                    if (e.name.indexOf('lift-api.vfsglobal.com') >= 0) {
+                                        r.apiCalls = r.apiCalls || [];
+                                        r.apiCalls.push(e.name.substring(0, 120));
+                                    }
+                                }
+                            } catch(e) {}
+
+                            // Try common VFS login endpoints
+                            loginUrls = [
+                                'https://lift-api.vfsglobal.com/master/login',
+                                'https://lift-api.vfsglobal.com/account/login',
+                                'https://lift-api.vfsglobal.com/login'
+                            ];
+
+                            var body = {
+                                username: email,
+                                password: password,
+                                captcha_api_key: captchaToken,
+                                captcha_version: 'Turnstile'
+                            };
+
+                            for (var ui = 0; ui < loginUrls.length; ui++) {
+                                var url = loginUrls[ui];
+                                try {
+                                    var resp = await fetch(url, {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            'Accept': 'application/json, text/plain, */*',
+                                            'Origin': 'https://visa.vfsglobal.com',
+                                            'Referer': 'https://visa.vfsglobal.com/',
+                                            'Route': 'are/en/prt'
+                                        },
+                                        body: JSON.stringify(body)
+                                    });
+                                    r.url = url;
+                                    r.status = resp.status;
+                                    var text = await resp.text();
+                                    r.resp = text.substring(0, 500);
+
+                                    // If we got a real response (not 404), stop trying
+                                    if (resp.status !== 404) {
+                                        // Try to parse and store JWT if present
+                                        try {
+                                            var data = JSON.parse(text);
+                                            if (data.token || data.jwt || data.JWT ||
+                                                data.authorize || data.accessToken) {
+                                                r.gotToken = true;
+                                                var tok = data.token || data.jwt || data.JWT ||
+                                                          data.authorize || data.accessToken;
+                                                // Store in sessionStorage for normal flow
+                                                window.sessionStorage.setItem('JWT', tok);
+                                                r.jwtStored = true;
+                                            }
+                                        } catch(e) {}
+                                        break;
+                                    }
+                                } catch(e) {
+                                    r.url = url;
+                                    r.fetchErr = e.message;
+                                }
+                            }
+
+                            return r;
+                        }
+                    """, [VFS_EMAIL, token])
+                    logger.info("NUCLEAR fetch result: %s", nuclear_result)
 
                 await page.wait_for_timeout(2000)
 
