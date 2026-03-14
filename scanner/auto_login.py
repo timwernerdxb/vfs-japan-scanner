@@ -399,31 +399,36 @@ async def _do_login() -> dict:
             // Platform
             Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
 
-            // Hook Turnstile to capture sitekey and callback
+            // NON-INVASIVE Turnstile capture:
+            // Do NOT use Object.defineProperty on window.turnstile — it blocks
+            // Cloudflare's script from initializing. Instead, poll until
+            // window.turnstile.render exists, then wrap it to capture sitekey.
             window.__capturedTurnstileSitekey = null;
             window.__turnstileCallback = null;
             window.__turnstileWidgetId = null;
-            let _turnstileObj = null;
-            Object.defineProperty(window, 'turnstile', {
-                set: function(val) {
-                    _turnstileObj = val;
-                    if (val && val.render) {
-                        const origRender = val.render;
-                        val.render = function(container, options) {
+            (function() {
+                let wrapped = false;
+                const poll = setInterval(() => {
+                    if (window.turnstile && window.turnstile.render && !wrapped) {
+                        wrapped = true;
+                        const origRender = window.turnstile.render.bind(window.turnstile);
+                        window.turnstile.render = function(container, options) {
                             if (options && options.sitekey) {
                                 window.__capturedTurnstileSitekey = options.sitekey;
-                                window.__turnstileCallback = options.callback;
+                                window.__turnstileCallback = options.callback || null;
                                 console.log('TURNSTILE_SITEKEY_CAPTURED:' + options.sitekey);
                             }
                             const widgetId = origRender.apply(this, arguments);
                             window.__turnstileWidgetId = widgetId;
                             return widgetId;
                         };
+                        console.log('TURNSTILE_RENDER_WRAPPED');
+                        clearInterval(poll);
                     }
-                },
-                get: function() { return _turnstileObj; },
-                configurable: true,
-            });
+                }, 100);
+                // Stop polling after 120s
+                setTimeout(() => clearInterval(poll), 120000);
+            })();
         }
         """)
 
@@ -461,6 +466,8 @@ async def _do_login() -> dict:
                 key = text.split("TURNSTILE_SITEKEY_CAPTURED:")[1].strip()
                 captured_turnstile_sitekey["key"] = key
                 logger.info("Captured Turnstile sitekey from console hook: %s...", key[:12])
+            if "TURNSTILE_RENDER_WRAPPED" in text:
+                logger.info("Turnstile render() successfully wrapped")
 
         page.on("console", on_console)
 
@@ -664,24 +671,32 @@ async def _do_login() -> dict:
                 raise RuntimeError("Could not find password input field")
 
             # Solve Turnstile CAPTCHA via CapSolver
-            # The Turnstile API script (volt-recaptcha) loads VERY late on VFS.
-            # We must wait for it to load and call render() before we can get the sitekey.
-            logger.info("Waiting for Turnstile API to load and render...")
+            # Now that we're NOT blocking Turnstile with Object.defineProperty,
+            # it should initialize normally. Poll for the sitekey.
+            logger.info("Waiting for Turnstile to initialize (no longer blocking it)...")
             sitekey = None
-            for ts_wait in range(24):  # 24 × 5s = 120s max
+            for ts_wait in range(40):  # 40 × 3s = 120s max
                 # Check all sources for sitekey
                 sitekey = await page.evaluate("""
                     () => {
-                        // From our hook
+                        // From our render() wrapper hook
                         if (window.__capturedTurnstileSitekey) return window.__capturedTurnstileSitekey;
-                        // From DOM
+                        // From DOM elements
                         const el = document.querySelector('.cf-turnstile, [data-sitekey]');
                         if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
-                        // From iframes
+                        // From Turnstile iframes
                         const iframes = document.querySelectorAll('iframe');
                         for (const f of iframes) {
                             const m = f.src && f.src.match(/sitekey=([^&]+)/);
                             if (m) return m[1];
+                        }
+                        // From inline scripts
+                        const scripts = document.querySelectorAll('script');
+                        for (const s of scripts) {
+                            if (s.textContent) {
+                                const m = s.textContent.match(/sitekey['"]?\s*[:=]\s*['"]?(0x[a-fA-F0-9]+)/);
+                                if (m) return m[1];
+                            }
                         }
                         return null;
                     }
@@ -694,17 +709,21 @@ async def _do_login() -> dict:
                     sitekey = captured_turnstile_sitekey["key"]
                     logger.info("Turnstile sitekey via network (attempt %d): %s...", ts_wait + 1, sitekey[:16])
                     break
-                # Log status every 15s
+                # Log detailed status every 9s (every 3rd iteration)
                 if (ts_wait + 1) % 3 == 0:
                     ts_status = await page.evaluate("""
                         () => ({
-                            turnstile: typeof window.turnstile,
+                            turnstileType: typeof window.turnstile,
+                            turnstileHasRender: !!(window.turnstile && window.turnstile.render),
+                            hookCaptured: window.__capturedTurnstileSitekey,
                             cfDivs: document.querySelectorAll('.cf-turnstile').length,
                             sitekeyEls: document.querySelectorAll('[data-sitekey]').length,
+                            iframes: Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(s => s),
+                            voltScript: !!document.querySelector('#volt-recaptcha'),
                         })
                     """)
-                    logger.info("Turnstile wait %d/24 — status: %s", ts_wait + 1, ts_status)
-                await page.wait_for_timeout(5000)
+                    logger.info("Turnstile wait %d/40 — status: %s", ts_wait + 1, ts_status)
+                await page.wait_for_timeout(3000)
             else:
                 logger.warning("Turnstile sitekey not found after 120s")
 
