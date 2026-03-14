@@ -12,17 +12,23 @@ import time
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-CAPSOLVER_API_KEY = os.environ.get("CAPSOLVER_API_KEY", "").strip()
-
 CAPSOLVER_CREATE_URL = "https://api.capsolver.com/createTask"
 CAPSOLVER_RESULT_URL = "https://api.capsolver.com/getTaskResult"
 
 logger = logging.getLogger("captcha_solver")
 
-if CAPSOLVER_API_KEY:
-    logger.info("CapSolver API key loaded (length: %d, starts: %s...)", len(CAPSOLVER_API_KEY), CAPSOLVER_API_KEY[:8])
-else:
-    logger.warning("CAPSOLVER_API_KEY not set or empty — Turnstile solving will fail")
+
+def _get_api_key() -> str:
+    """Read API key at call time (not import time) to handle late env var loading."""
+    key = os.environ.get("CAPSOLVER_API_KEY", "").strip()
+    if key:
+        logger.info("CapSolver API key loaded (length: %d, starts: %s...)", len(key), key[:8])
+    else:
+        # Log ALL env vars that contain "CAP" or "SOLVER" to help debug
+        cap_vars = {k: v[:8] + "..." for k, v in os.environ.items()
+                    if "CAP" in k.upper() or "SOLVER" in k.upper()}
+        logger.warning("CAPSOLVER_API_KEY not found. Related env vars: %s", cap_vars or "none")
+    return key
 
 
 def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> str:
@@ -40,14 +46,15 @@ def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> s
     Raises:
         RuntimeError: If solving fails or times out.
     """
-    if not CAPSOLVER_API_KEY:
+    api_key = _get_api_key()
+    if not api_key:
         raise RuntimeError("CAPSOLVER_API_KEY environment variable not set")
 
     logger.info("Solving Turnstile for %s (sitekey=%s...)", website_url, website_key[:12])
 
     # Step 1: Create task
     payload = json.dumps({
-        "clientKey": CAPSOLVER_API_KEY,
+        "clientKey": api_key,
         "task": {
             "type": "AntiTurnstileTaskProxyLess",
             "websiteURL": website_url,
@@ -79,7 +86,7 @@ def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> s
         time.sleep(3)
 
         poll_payload = json.dumps({
-            "clientKey": CAPSOLVER_API_KEY,
+            "clientKey": api_key,
             "taskId": task_id,
         }).encode("utf-8")
 
