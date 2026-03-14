@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
 
-from scanner.captcha_solver import solve_turnstile, solve_recaptcha_v3
+from scanner.captcha_solver import solve_turnstile
 
 VFS_LOGIN_URL = "https://visa.vfsglobal.com/are/en/prt/login"
 
@@ -397,126 +397,14 @@ async def _do_login() -> dict:
             try { Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'}); } catch(e) {}
             console.log('INIT_STEALTH_DONE');
 
-            // ── TURNSTILE CALLBACK CAPTURE (getter/setter trap) ──
+            // ── CAPTCHA TOKEN STORAGE (set from Python after CapSolver solve) ──
             try {
-                window.__capturedTurnstileSitekey = null;
+                window.__captchaToken = null;
                 window.__turnstileCallback = null;
-                window.__turnstileWidgetId = null;
                 window.__allTurnstileCallbacks = [];
-
-                function _wrapTs(ts) {
-                    if (!ts || typeof ts !== 'object' || ts.__wrapped) return ts;
-                    if (typeof ts.render === 'function') {
-                        const orig = ts.render.bind(ts);
-                        ts.render = function(c, o) {
-                            console.log('TURNSTILE_RENDER_INTERCEPTED');
-                            if (o) {
-                                if (o.sitekey) { window.__capturedTurnstileSitekey = o.sitekey; console.log('TURNSTILE_SITEKEY:'+o.sitekey); }
-                                if (o.callback) { window.__turnstileCallback = o.callback; window.__allTurnstileCallbacks.push(o.callback); console.log('TURNSTILE_CB_CAPTURED'); }
-                                if (o['error-callback']) o['error-callback'] = function(){};
-                                if (o['expired-callback']) o['expired-callback'] = function(){};
-                            }
-                            try { var r = orig(c, o); window.__turnstileWidgetId = r; return r; }
-                            catch(e) { return 'fw0'; }
-                        };
-                    }
-                    if (typeof ts.execute === 'function') {
-                        const origE = ts.execute.bind(ts);
-                        ts.execute = function(c, o) {
-                            console.log('TURNSTILE_EXECUTE_INTERCEPTED');
-                            if (o && o.callback) { window.__turnstileCallback = o.callback; console.log('TURNSTILE_CB_VIA_EXEC'); }
-                            try { return origE(c, o); } catch(e) { return 'fw0'; }
-                        };
-                    }
-                    ts.__wrapped = true;
-                    console.log('TURNSTILE_WRAPPED');
-                    return ts;
-                }
-
-                let _realTs = null;
-                Object.defineProperty(window, 'turnstile', {
-                    get() { return _realTs; },
-                    set(v) { console.log('TURNSTILE_SET type='+typeof v); _realTs = v; if (v && typeof v==='object') _wrapTs(v); },
-                    configurable: true, enumerable: true
-                });
-                // Polling fallback
-                const _tp = setInterval(() => { try { var t=window.turnstile; if(t&&typeof t==='object'&&!t.__wrapped){_wrapTs(t);console.log('TURNSTILE_POLL_WRAP');} }catch(e){} }, 500);
-                setTimeout(() => clearInterval(_tp), 60000);
-                console.log('INIT_TURNSTILE_TRAP_OK');
-            } catch(e) { console.log('INIT_TURNSTILE_TRAP_FAIL:'+e.message); }
-
-            // ── RECAPTCHA INTERCEPTION (getter/setter + execute override) ──
-            // VFS uses reCAPTCHA v3 for login (via volt-recaptcha script).
-            // We intercept grecaptcha.execute() to return our pre-solved token.
-            try {
-                window.__recaptchaSitekey = null;
-                window.__recaptchaToken = null;  // Set from Python after CapSolver
-                window.__recaptchaResolvers = [];
-                window.__recaptchaCallback = null;
-
-                function _wrapGc(gc) {
-                    if (!gc || typeof gc !== 'object' || gc.__wrapped) return gc;
-
-                    // Wrap execute() — reCAPTCHA v3 main method
-                    if (typeof gc.execute === 'function') {
-                        const origExec = gc.execute.bind(gc);
-                        gc.execute = function(sitekey, options) {
-                            console.log('RECAPTCHA_EXECUTE sk='+sitekey+' action='+(options?.action||''));
-                            window.__recaptchaSitekey = sitekey;
-
-                            // If we already have a pre-solved token, return immediately
-                            if (window.__recaptchaToken) {
-                                console.log('RECAPTCHA_RETURNING_PRESOLVED');
-                                return Promise.resolve(window.__recaptchaToken);
-                            }
-
-                            // Otherwise wait for Python to set the token
-                            console.log('RECAPTCHA_WAITING_FOR_TOKEN');
-                            return new Promise(function(resolve) {
-                                window.__recaptchaResolvers.push(resolve);
-                                var cid = setInterval(function() {
-                                    if (window.__recaptchaToken) {
-                                        clearInterval(cid);
-                                        resolve(window.__recaptchaToken);
-                                    }
-                                }, 500);
-                                // Timeout: fall back to real execute after 90s
-                                setTimeout(function() {
-                                    clearInterval(cid);
-                                    console.log('RECAPTCHA_TIMEOUT_FALLBACK');
-                                    origExec(sitekey, options).then(resolve);
-                                }, 90000);
-                            });
-                        };
-                    }
-
-                    // Wrap render() — reCAPTCHA v2 (if used)
-                    if (typeof gc.render === 'function') {
-                        const origR = gc.render.bind(gc);
-                        gc.render = function(c, o) {
-                            console.log('RECAPTCHA_RENDER');
-                            if (o && o.sitekey) { window.__recaptchaSitekey = o.sitekey; console.log('RECAPTCHA_SITEKEY:'+o.sitekey); }
-                            if (o && o.callback) { window.__recaptchaCallback = o.callback; console.log('RECAPTCHA_CB_CAPTURED'); }
-                            return origR(c, o);
-                        };
-                    }
-
-                    gc.__wrapped = true;
-                    console.log('RECAPTCHA_WRAPPED');
-                    return gc;
-                }
-
-                let _realGc = null;
-                Object.defineProperty(window, 'grecaptcha', {
-                    get() { return _realGc; },
-                    set(v) { console.log('RECAPTCHA_SET type='+typeof v); _realGc = v; if (v && typeof v==='object') _wrapGc(v); },
-                    configurable: true, enumerable: true
-                });
-                // Polling fallback for grecaptcha
-                const _gp = setInterval(() => { try { var g=window.grecaptcha; if(g&&typeof g==='object'&&!g.__wrapped){_wrapGc(g);console.log('RECAPTCHA_POLL_WRAP');} }catch(e){} }, 500);
-                setTimeout(() => clearInterval(_gp), 60000);
-                console.log('INIT_RECAPTCHA_TRAP_OK');
-            } catch(e) { console.log('INIT_RECAPTCHA_TRAP_FAIL:'+e.message); }
+                window.__capturedTurnstileSitekey = null;
+                console.log('INIT_CAPTCHA_VARS_OK');
+            } catch(e) { console.log('INIT_CAPTCHA_VARS_FAIL:'+e.message); }
 
             // ── SCRIPT TAG OBSERVER ──
             try {
@@ -525,17 +413,7 @@ async def _do_login() -> dict:
                         for (const node of m.addedNodes) {
                             if (node.tagName === 'SCRIPT' && node.src) {
                                 if (node.src.includes('challenges.cloudflare.com'))
-                                    console.log('TURNSTILE_SCRIPT:'+node.src.substring(0,100));
-                                if (node.src.includes('recaptcha') || node.src.includes('gstatic.com'))
-                                    console.log('RECAPTCHA_SCRIPT:'+node.src.substring(0,100));
-                                // Capture reCAPTCHA sitekey from URL render= param
-                                if (node.src.includes('recaptcha')) {
-                                    var rm = node.src.match(/[?&]render=([^&]+)/);
-                                    if (rm && rm[1] !== 'explicit') {
-                                        window.__recaptchaSitekey = rm[1];
-                                        console.log('RECAPTCHA_SITEKEY_FROM_URL:'+rm[1]);
-                                    }
-                                }
+                                    console.log('SCRIPT_ADDED:'+node.src.substring(0,120));
                             }
                         }
                     }
@@ -548,7 +426,6 @@ async def _do_login() -> dict:
 
         # Intercept requests to capture auth headers and CAPTCHA sitekeys
         captured_turnstile_sitekey = {}
-        captured_recaptcha_sitekey = {}
 
         async def on_request(request):
             url = request.url
@@ -592,7 +469,7 @@ async def _do_login() -> dict:
 
         page.on("response", on_response)
 
-        # Capture JS console messages (errors + Turnstile sitekey)
+        # Capture JS console messages (errors + fake Turnstile events)
         js_errors = []
 
         def on_console(msg):
@@ -603,31 +480,17 @@ async def _do_login() -> dict:
             # Log init script section confirmations
             if text.startswith("INIT_"):
                 logger.info("[console] %s", text)
-            # Log ALL our CAPTCHA interception messages
-            if text.startswith("TURNSTILE_") or text.startswith("RECAPTCHA_"):
+            # Log fake Turnstile events (from our route-injected script)
+            if text.startswith("FAKE_TS_"):
                 logger.info("[console] %s", text)
-            # Capture Turnstile sitekey from our hook
-            if "TURNSTILE_SITEKEY_CAPTURED:" in text:
-                key = text.split("TURNSTILE_SITEKEY_CAPTURED:")[1].strip()
+            # Log script additions (from MutationObserver)
+            if text.startswith("SCRIPT_ADDED:"):
+                logger.info("[console] %s", text)
+            # Capture sitekey from fake Turnstile render
+            if "FAKE_TS_SITEKEY:" in text:
+                key = text.split("FAKE_TS_SITEKEY:")[1].strip()
                 captured_turnstile_sitekey["key"] = key
-                logger.info("Captured Turnstile sitekey from console hook: %s...", key[:12])
-            if "TURNSTILE_RENDER_WRAPPED" in text:
-                logger.info("Turnstile render() successfully wrapped")
-            # Capture reCAPTCHA sitekey from execute() intercept
-            if "RECAPTCHA_EXECUTE" in text:
-                # Format: RECAPTCHA_EXECUTE sk=6L... action=login
-                for part in text.split():
-                    if part.startswith("sk="):
-                        captured_recaptcha_sitekey["key"] = part[3:]
-                        logger.info("Captured reCAPTCHA sitekey from execute: %s", part[3:])
-            if "RECAPTCHA_SITEKEY_FROM_URL:" in text:
-                key = text.split("RECAPTCHA_SITEKEY_FROM_URL:")[1].strip()
-                captured_recaptcha_sitekey["key"] = key
-                logger.info("Captured reCAPTCHA sitekey from URL: %s", key)
-            if "RECAPTCHA_SITEKEY:" in text and "FROM_URL" not in text:
-                key = text.split("RECAPTCHA_SITEKEY:")[1].strip()
-                captured_recaptcha_sitekey["key"] = key
-                logger.info("Captured reCAPTCHA sitekey: %s", key)
+                logger.info("Captured Turnstile sitekey from fake render: %s", key)
 
         page.on("console", on_console)
 
@@ -739,6 +602,97 @@ async def _do_login() -> dict:
                     break
                 except Exception:
                     continue
+
+            # ── FAKE TURNSTILE: Route-intercept api.js and return our own ──
+            # Instead of trying to wrap the real Turnstile (which never worked —
+            # window.turnstile stayed undefined), we intercept the api.js HTTP
+            # request and return a fake that immediately invokes Angular's callback
+            # with our CapSolver-solved token stored in window.__captchaToken.
+            # This is set up AFTER the page-level Cloudflare challenge so we
+            # don't interfere with it (it uses /cdn-cgi/challenge-platform/ paths).
+            async def intercept_turnstile_api(route):
+                """Replace Cloudflare Turnstile api.js with our fake."""
+                logger.info("[route] Intercepting Turnstile api.js — returning fake")
+                fake_script = """
+                (function() {
+                    console.log('FAKE_TS_LOADED');
+
+                    window.turnstile = {
+                        render: function(container, options) {
+                            console.log('FAKE_TS_RENDER container=' +
+                                (typeof container === 'string' ? container : 'element'));
+                            if (options) {
+                                if (options.sitekey) {
+                                    window.__capturedTurnstileSitekey = options.sitekey;
+                                    console.log('FAKE_TS_SITEKEY:' + options.sitekey);
+                                }
+                                if (typeof options.callback === 'function') {
+                                    window.__turnstileCallback = options.callback;
+                                    window.__allTurnstileCallbacks.push(options.callback);
+                                    console.log('FAKE_TS_CB_STORED');
+
+                                    if (window.__captchaToken) {
+                                        console.log('FAKE_TS_CB_INVOKE_IMMEDIATE');
+                                        try { options.callback(window.__captchaToken); }
+                                        catch(e) { console.log('FAKE_TS_CB_ERR:' + e.message); }
+                                    } else {
+                                        console.log('FAKE_TS_POLLING_FOR_TOKEN');
+                                        var pollId = setInterval(function() {
+                                            if (window.__captchaToken) {
+                                                clearInterval(pollId);
+                                                console.log('FAKE_TS_CB_INVOKE_POLLED');
+                                                try {
+                                                    if (window.__turnstileCallback)
+                                                        window.__turnstileCallback(window.__captchaToken);
+                                                } catch(e) {
+                                                    console.log('FAKE_TS_POLL_ERR:' + e.message);
+                                                }
+                                            }
+                                        }, 200);
+                                        setTimeout(function() { clearInterval(pollId); }, 120000);
+                                    }
+                                }
+                                if (options['error-callback']) {
+                                    // Suppress — our fake never errors
+                                }
+                            }
+                            return 'fake_widget_0';
+                        },
+                        execute: function(container, options) {
+                            console.log('FAKE_TS_EXECUTE');
+                            if (options && typeof options.callback === 'function') {
+                                options.callback(window.__captchaToken || '');
+                            }
+                            return window.__captchaToken || '';
+                        },
+                        getResponse: function(widgetId) {
+                            return window.__captchaToken || '';
+                        },
+                        reset: function(widgetId) {
+                            console.log('FAKE_TS_RESET');
+                        },
+                        remove: function(widgetId) {},
+                        isExpired: function(widgetId) { return false; },
+                        ready: function(callback) {
+                            console.log('FAKE_TS_READY');
+                            if (typeof callback === 'function') callback();
+                        }
+                    };
+                    console.log('FAKE_TS_SETUP_DONE');
+                })();
+                """
+                await route.fulfill(
+                    content_type="application/javascript",
+                    body=fake_script,
+                )
+
+            # Intercept ONLY the Turnstile api.js — NOT challenge-platform paths
+            # (those are used by the page-level Cloudflare challenge)
+            await page.route(
+                "**/challenges.cloudflare.com/turnstile/v0/api.js*",
+                intercept_turnstile_api,
+            )
+            logger.info("Fake Turnstile route intercept set up")
 
             # Fill credentials first — Turnstile may render after form interaction
             logger.info("Filling login credentials...")
@@ -959,374 +913,70 @@ async def _do_login() -> dict:
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
-                    # === MULTI-STRATEGY CAPTCHA TOKEN INJECTION ===
-                    inject_result = await page.evaluate("""
-                        (token) => {
-                            const results = [];
-                            let loginFormGroup = null;
-                            let loginComponent = null;
+                    # Store token in page for fake Turnstile to use
+                    # If fake turnstile.render() already fired (callback stored),
+                    # this will trigger the polling interval to invoke it.
+                    await page.evaluate(
+                        "(t) => { window.__captchaToken = t; console.log('TOKEN_SET len=' + t.length); }",
+                        token,
+                    )
+                    logger.info("Token stored in window.__captchaToken")
 
-                            // Helper: patch a found FormGroup
-                            function patchFormGroup(fg, comp, source) {
-                                results.push('FOUND_FORM:' + source);
-                                const cKeys = Object.keys(fg.controls);
-                                results.push('controls=' + cKeys.join(','));
+                    # Check if fake Turnstile already captured a callback
+                    cb_state = await page.evaluate("""
+                        () => ({
+                            callback: !!window.__turnstileCallback,
+                            all_cbs: (window.__allTurnstileCallbacks || []).length,
+                            ts_exists: typeof window.turnstile !== 'undefined' && window.turnstile !== null,
+                            sitekey: window.__capturedTurnstileSitekey || null,
+                        })
+                    """)
+                    logger.info("Post-solve state: %s", cb_state)
 
-                                // Set captcha_api_key
-                                if (fg.controls.captcha_api_key) {
-                                    fg.controls.captcha_api_key.setValue(token);
-                                    if (fg.controls.captcha_api_key.clearValidators)
-                                        fg.controls.captcha_api_key.clearValidators();
-                                    fg.controls.captcha_api_key.setErrors(null);
-                                    fg.controls.captcha_api_key.updateValueAndValidity();
-                                    results.push('SET_captcha_api_key');
-                                }
-
-                                // Set captcha_version
-                                if (fg.controls.captcha_version) {
-                                    let version = 'Turnstile';
-                                    if (comp) {
-                                        const compProps = Object.getOwnPropertyNames(comp);
-                                        for (const cp of compProps) {
-                                            try {
-                                                const cv = comp[cp];
-                                                if (cv && typeof cv === 'object' &&
-                                                    (cv.cloudflare || cv.alternate || cv.default)) {
-                                                    version = cv.cloudflare || cv.alternate || version;
-                                                    results.push('version_const=' + cp + ':' + version);
-                                                    break;
-                                                }
-                                            } catch(e) {}
-                                        }
-                                    }
-                                    fg.controls.captcha_version.setValue(version);
-                                    if (fg.controls.captcha_version.clearValidators)
-                                        fg.controls.captcha_version.clearValidators();
-                                    fg.controls.captcha_version.setErrors(null);
-                                    fg.controls.captcha_version.updateValueAndValidity();
-                                    results.push('SET_captcha_version:' + version);
-                                }
-
-                                // Clear validators on ALL captcha-related controls
-                                for (const cn of cKeys) {
-                                    const lower = cn.toLowerCase();
-                                    if (lower.includes('captcha') || lower.includes('token') ||
-                                        lower.includes('turnstile') || lower.includes('otp')) {
-                                        const ctrl = fg.controls[cn];
-                                        if (ctrl.clearValidators) ctrl.clearValidators();
-                                        ctrl.setErrors(null);
-                                        ctrl.updateValueAndValidity();
-                                        results.push('cleared:' + cn);
-                                    }
-                                }
-
-                                fg.updateValueAndValidity();
-                                results.push('form_valid:' + fg.valid);
-                                results.push('form_status:' + fg.status);
-                            }
-
-                            // Helper: check if an object is a FormGroup with login controls
-                            function isLoginFormGroup(obj) {
-                                if (!obj || typeof obj !== 'object') return false;
-                                if (!obj.controls || typeof obj.controls !== 'object') return false;
-                                const keys = Object.keys(obj.controls);
-                                return keys.includes('username') || keys.includes('password') ||
-                                       keys.includes('captcha_api_key');
-                            }
-
-                            // === STRATEGY 1: Captured Turnstile callback ===
-                            if (window.__turnstileCallback) {
-                                try {
-                                    window.__turnstileCallback(token);
-                                    results.push('S1_CALLBACK_INVOKED');
-                                } catch(e) {
-                                    results.push('s1_err:' + e.message);
+                    # If callback was stored but token wasn't available yet, invoke now
+                    if cb_state.get("callback") and token:
+                        logger.info("Callback already stored — invoking with token")
+                        await page.evaluate("""
+                            (token) => {
+                                if (window.__turnstileCallback) {
+                                    try { window.__turnstileCallback(token); console.log('TOKEN_CB_INVOKED'); }
+                                    catch(e) { console.log('TOKEN_CB_ERR:' + e.message); }
                                 }
                             }
-                            if (window.__allTurnstileCallbacks) {
-                                for (let i = 0; i < window.__allTurnstileCallbacks.length; i++) {
-                                    try {
-                                        window.__allTurnstileCallbacks[i](token);
-                                        results.push('S1_CB_' + i);
-                                    } catch(e) {}
-                                }
-                            }
-
-                            // === STRATEGY 2: Angular ng.getComponent() API ===
-                            // Works in production mode — walks UP from form elements
-                            if (typeof ng !== 'undefined' && typeof ng.getComponent === 'function') {
-                                results.push('S2_ng_available');
-                                const formEls = document.querySelectorAll(
-                                    '[formcontrolname], form, app-login, [class*=login]');
-                                for (const el of formEls) {
-                                    let current = el;
-                                    while (current && !loginFormGroup) {
-                                        try {
-                                            const comp = ng.getComponent(current);
-                                            if (comp) {
-                                                results.push('S2_comp_at:' + current.tagName.toLowerCase());
-                                                const props = Object.getOwnPropertyNames(comp);
-                                                for (const p of props) {
-                                                    try {
-                                                        if (isLoginFormGroup(comp[p])) {
-                                                            loginFormGroup = comp[p];
-                                                            loginComponent = comp;
-                                                            patchFormGroup(loginFormGroup, loginComponent, 'ng_api');
-                                                            break;
-                                                        }
-                                                    } catch(e) {}
-                                                }
-                                            }
-                                        } catch(e) {}
-                                        current = current.parentElement;
-                                    }
-                                    if (loginFormGroup) break;
-                                }
-                            } else {
-                                results.push('S2_ng_not_available');
-                            }
-
-                            // === STRATEGY 3: LView search (handles numeric __ngContext__) ===
-                            if (!loginFormGroup) {
-                                const lViews = new Set();
-                                const allElements = document.querySelectorAll('*');
-
-                                // Collect array contexts
-                                for (const el of allElements) {
-                                    const ctx = el.__ngContext__;
-                                    if (Array.isArray(ctx) && ctx.length > 5) {
-                                        lViews.add(ctx);
-                                    }
-                                }
-
-                                // For numeric contexts, find parent LView
-                                // In Angular 17+, numeric __ngContext__ = index in parent LView
-                                // The parent LView is on a parent element
-                                if (lViews.size === 0) {
-                                    results.push('S3_no_array_ctx');
-                                    // Try to find LView via numeric context chain
-                                    for (const el of allElements) {
-                                        const ctx = el.__ngContext__;
-                                        if (typeof ctx === 'number') {
-                                            // Walk up to find array context
-                                            let parent = el.parentElement;
-                                            while (parent) {
-                                                const pCtx = parent.__ngContext__;
-                                                if (Array.isArray(pCtx) && pCtx.length > 5) {
-                                                    lViews.add(pCtx);
-                                                    break;
-                                                }
-                                                parent = parent.parentElement;
-                                            }
-                                        }
-                                        if (lViews.size > 0) break;
-                                    }
-                                }
-
-                                // Also try getAllAngularRootElements
-                                try {
-                                    const roots = typeof getAllAngularRootElements === 'function'
-                                        ? getAllAngularRootElements() : [];
-                                    for (const r of roots) {
-                                        if (Array.isArray(r.__ngContext__)) lViews.add(r.__ngContext__);
-                                    }
-                                } catch(e) {}
-
-                                results.push('S3_lviews:' + lViews.size);
-
-                                // Recursively collect nested LViews
-                                for (const lv of [...lViews]) {
-                                    (function nest(arr, d) {
-                                        if (d > 4) return;
-                                        for (let i = 0; i < arr.length; i++) {
-                                            if (Array.isArray(arr[i]) && arr[i].length > 5 && !lViews.has(arr[i])) {
-                                                lViews.add(arr[i]);
-                                                nest(arr[i], d + 1);
-                                            }
-                                        }
-                                    })(lv, 0);
-                                }
-
-                                // Search LViews for component with FormGroup
-                                for (const lView of lViews) {
-                                    for (let i = 0; i < Math.min(lView.length, 120); i++) {
-                                        const item = lView[i];
-                                        if (!item || typeof item !== 'object') continue;
-                                        if (item instanceof Node || item instanceof Window) continue;
-                                        if (Array.isArray(item)) continue;
-
-                                        try {
-                                            const props = Object.getOwnPropertyNames(item).slice(0, 80);
-                                            for (const prop of props) {
-                                                try {
-                                                    if (isLoginFormGroup(item[prop])) {
-                                                        loginFormGroup = item[prop];
-                                                        loginComponent = item;
-                                                        patchFormGroup(loginFormGroup, loginComponent, 'lview');
-                                                        break;
-                                                    }
-                                                } catch(e) {}
-                                            }
-                                        } catch(e) {}
-                                        if (loginFormGroup) break;
-                                    }
-                                    if (loginFormGroup) break;
-                                }
-                            }
-
-                            // === STRATEGY 4: DOM events on formcontrolname elements ===
-                            // Angular's ValueAccessor listens for 'input' events.
-                            // If captcha controls have DOM elements, set values via events.
-                            if (!loginFormGroup) {
-                                results.push('S4_dom_events');
-                                const captchaInput = document.querySelector(
-                                    '[formcontrolname*="captcha"], [formcontrolname*="token"]');
-                                if (captchaInput) {
-                                    results.push('S4_found:' + captchaInput.getAttribute('formcontrolname'));
-                                    const setter = Object.getOwnPropertyDescriptor(
-                                        HTMLInputElement.prototype, 'value').set;
-                                    setter.call(captchaInput, token);
-                                    captchaInput.dispatchEvent(new Event('input', {bubbles: true}));
-                                    captchaInput.dispatchEvent(new Event('change', {bubbles: true}));
-                                    captchaInput.dispatchEvent(new Event('blur', {bubbles: true}));
-                                    results.push('S4_value_set');
-                                } else {
-                                    results.push('S4_no_captcha_input');
-                                }
-                            }
-
-                            // === FALLBACK: Set hidden inputs ===
-                            const hiddenNames = ['cf-turnstile-response', 'g-recaptcha-response'];
-                            for (const name of hiddenNames) {
-                                const input = document.querySelector('[name="' + name + '"]');
-                                if (input) {
-                                    try {
-                                        const setter = Object.getOwnPropertyDescriptor(
-                                            HTMLInputElement.prototype, 'value').set;
-                                        setter.call(input, token);
-                                        input.dispatchEvent(new Event('input', {bubbles: true}));
-                                        input.dispatchEvent(new Event('change', {bubbles: true}));
-                                        results.push('hidden_set:' + name);
-                                    } catch(e) {}
-                                }
-                            }
-
-                            // Override turnstile.getResponse
-                            try {
-                                if (window.turnstile) {
-                                    window.turnstile.getResponse = () => token;
-                                    results.push('getResponse_overridden');
-                                }
-                            } catch(e) {}
-
-                            return results;
-                        }
-                    """, token)
-                    logger.info("Injection results: %s", inject_result)
-                    await page.wait_for_timeout(3000)
+                        """, token)
+                        await page.wait_for_timeout(2000)
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
             else:
-                logger.warning("No Turnstile sitekey found — proceeding to reCAPTCHA check")
-
-            # ── TURNSTILE CALLBACK WAIT ──
-            # VFS login CAPTCHA is Turnstile (not reCAPTCHA!) — the #volt-recaptcha
-            # script loads challenges.cloudflare.com/turnstile/v0/api.js.
-            # Our init script wraps turnstile.render() to capture the callback.
-            # Wait briefly for callback to be captured, then try invoking it.
-            # NOTE: Angular may not call render() until Sign In is clicked,
-            # so the main callback invocation happens in the post-click loop.
-            logger.info("Checking for Turnstile callback (pre-click)...")
-
-            for cb_wait in range(8):  # 8 × 2s = 16s (short: callback likely comes post-click)
-                ts_state = await page.evaluate("""
-                    () => {
-                        const s = {};
-                        s.turnstile_exists = typeof window.turnstile !== 'undefined' && window.turnstile !== null;
-                        s.turnstile_type = typeof window.turnstile;
-                        s.turnstile_wrapped = !!(window.turnstile && window.turnstile.__wrapped);
-                        s.callback_captured = !!window.__turnstileCallback;
-                        s.all_callbacks = (window.__allTurnstileCallbacks || []).length;
-                        s.widget_id = window.__turnstileWidgetId || null;
-                        s.captured_sitekey = window.__capturedTurnstileSitekey || null;
-                        s.button_disabled = (() => {
-                            const btns = document.querySelectorAll('button');
-                            for (const b of btns) {
-                                if ((b.textContent || '').includes('Sign In')) return b.disabled;
-                            }
-                            return null;
-                        })();
-                        // Check if turnstile exists but wasn't wrapped (init script issue)
-                        if (s.turnstile_exists && !s.turnstile_wrapped && window.turnstile) {
-                            s.turnstile_keys = Object.keys(window.turnstile).slice(0, 10);
-                        }
-                        return s;
-                    }
-                """)
-                if (cb_wait + 1) % 4 == 0 or ts_state.get("callback_captured"):
-                    logger.info("Turnstile state (%d/8): %s", cb_wait + 1, ts_state)
-
-                # If callback captured pre-click, invoke it!
-                if ts_state.get("callback_captured") and token:
-                    logger.info("Turnstile callback captured pre-click — invoking with solved token!")
-                    cb_result = await page.evaluate("""
-                        (token) => {
-                            const results = [];
-                            if (window.__turnstileCallback) {
-                                try { window.__turnstileCallback(token); results.push('main_cb'); }
-                                catch(e) { results.push('err:' + e.message); }
-                            }
-                            for (const cb of (window.__allTurnstileCallbacks || [])) {
-                                try { cb(token); results.push('cb_invoked'); }
-                                catch(e) {}
-                            }
-                            return results;
-                        }
-                    """, token)
-                    logger.info("Pre-click callback invocation: %s", cb_result)
-                    await page.wait_for_timeout(3000)
-                    break
-
-                # If button already enabled, we're good
-                if ts_state.get("button_disabled") is False:
-                    logger.info("Sign In button already enabled — skipping callback wait")
-                    break
-
-                # If turnstile exists but wasn't wrapped, try late-wrapping
-                if ts_state.get("turnstile_exists") and not ts_state.get("turnstile_wrapped"):
-                    logger.info("Turnstile exists but not wrapped — attempting late wrap")
-                    await page.evaluate("""
-                        () => {
-                            if (window.turnstile && typeof window.turnstile.render === 'function' && !window.turnstile.__wrapped) {
-                                const orig = window.turnstile.render.bind(window.turnstile);
-                                window.turnstile.render = function(c, o) {
-                                    console.log('TURNSTILE_LATE_RENDER');
-                                    if (o && o.callback) {
-                                        window.__turnstileCallback = o.callback;
-                                        window.__allTurnstileCallbacks.push(o.callback);
-                                        console.log('TURNSTILE_LATE_CB_CAPTURED');
-                                    }
-                                    if (o && o.sitekey) {
-                                        window.__capturedTurnstileSitekey = o.sitekey;
-                                    }
-                                    try { var r = orig(c, o); window.__turnstileWidgetId = r; return r; }
-                                    catch(e) { return 'fw0'; }
-                                };
-                                window.turnstile.__wrapped = true;
-                                console.log('TURNSTILE_LATE_WRAPPED');
-                            }
-                        }
-                    """)
-
-                await page.wait_for_timeout(2000)
+                logger.warning("No Turnstile sitekey found — will rely on hardcoded sitekey")
 
             # Determine best captcha token for route interceptor
             solved_captcha_token = token if sitekey else ""
             captcha_version = "Turnstile"
 
+            # Brief wait: if fake Turnstile already captured a callback,
+            # the polling interval should invoke it within ~1s
+            if token:
+                await page.wait_for_timeout(2000)
+                btn_state = await page.evaluate("""
+                    () => ({
+                        callback: !!window.__turnstileCallback,
+                        token_set: !!window.__captchaToken,
+                        ts_exists: typeof window.turnstile !== 'undefined',
+                        btn_disabled: (() => {
+                            const btns = document.querySelectorAll('button');
+                            for (const b of btns) {
+                                if ((b.textContent || '').includes('Sign In')) return b.disabled;
+                            }
+                            return null;
+                        })(),
+                    })
+                """)
+                logger.info("Pre-click state: %s", btn_state)
+
             # ── ROUTE INTERCEPTOR: Inject captcha token into login API POST ──
-            # Set up BEFORE form interaction so it's ready when Angular submits.
-            # From bundle analysis: VFS expects captcha_api_key + captcha_version in body.
+            # Belt-and-suspenders: even if fake Turnstile callback works,
+            # ensure the POST body has captcha_api_key + captcha_version.
 
             login_api_captured = {}
 
@@ -1447,15 +1097,16 @@ async def _do_login() -> dict:
             await sign_in.click(force=True)
             logger.info("Clicked Sign In button")
 
-            # ── POST-CLICK: Wait for navigation + Turnstile callback invocation ──
-            # After clicking Sign In, Angular triggers turnstile.render() which
-            # our init script wrapper captures. We poll for the callback and
-            # invoke it with our CapSolver-solved token.
-            logger.info("Waiting for post-login navigation (+ monitoring Turnstile callback)...")
+            # ── POST-CLICK: Wait for navigation ──
+            # After clicking Sign In, Angular loads our fake Turnstile api.js,
+            # calls turnstile.render() which immediately invokes the callback
+            # with our CapSolver token. This sets captcha_api_key in the form,
+            # making it valid → Angular fires the login POST → route interceptor
+            # ensures captcha fields are in the body → navigation to dashboard.
+            logger.info("Waiting for post-login navigation...")
             login_success = False
-            callback_invoked = False
 
-            for nav_wait in range(45):  # 45 × 2s = 90s max
+            for nav_wait in range(60):  # 60 × 2s = 120s max
                 current_url = page.url
 
                 # Check for successful navigation
@@ -1473,153 +1124,55 @@ async def _do_login() -> dict:
                 except Exception:
                     pass
 
-                # ── Turnstile callback invocation (THE KEY STEP) ──
-                # Angular calls turnstile.render() after we click Sign In.
-                # Our wrapper captures the callback. Invoke it with our token.
-                if not callback_invoked and token:
-                    ts_post = await page.evaluate("""
+                # Log state periodically
+                if (nav_wait + 1) % 5 == 0:
+                    state = await page.evaluate("""
                         () => ({
-                            callback: !!window.__turnstileCallback,
-                            all_cbs: (window.__allTurnstileCallbacks || []).length,
-                            wrapped: !!(window.turnstile && window.turnstile.__wrapped),
-                            ts_exists: typeof window.turnstile !== 'undefined' && window.turnstile !== null,
-                            widget_id: window.__turnstileWidgetId || null,
-                            btn_disabled: (() => {
-                                const btns = document.querySelectorAll('button');
-                                for (const b of btns) {
-                                    if ((b.textContent || '').includes('Sign In')) return b.disabled;
-                                }
-                                return null;
-                            })(),
+                            cb: !!window.__turnstileCallback,
+                            cbs: (window.__allTurnstileCallbacks || []).length,
+                            ts: typeof window.turnstile !== 'undefined',
+                            token: !!window.__captchaToken,
                         })
                     """)
+                    logger.info("Wait %d/60 — URL: %s | state: %s",
+                                nav_wait + 1, current_url, state)
 
-                    if (nav_wait + 1) % 5 == 0:
-                        logger.info("Post-click Turnstile state (%d/45): %s", nav_wait + 1, ts_post)
-
-                    if ts_post.get("callback"):
-                        logger.info("TURNSTILE CALLBACK CAPTURED! Invoking with solved token...")
-                        cb_result = await page.evaluate("""
-                            (token) => {
-                                const results = [];
-                                try {
-                                    if (window.__turnstileCallback) {
-                                        window.__turnstileCallback(token);
-                                        results.push('main_cb_invoked');
-                                    }
-                                } catch(e) { results.push('main_err:' + e.message); }
-                                for (const cb of (window.__allTurnstileCallbacks || [])) {
-                                    try { cb(token); results.push('cb_ok'); }
-                                    catch(e) { results.push('cb_err:' + e.message); }
+                # At 30s mark, force-enable + re-click as fallback
+                if nav_wait == 15:
+                    logger.info("30s elapsed — force-enable + re-click fallback")
+                    await page.evaluate("""
+                        () => {
+                            const allBtns = document.querySelectorAll('button');
+                            for (const btn of allBtns) {
+                                if ((btn.textContent || '').includes('Sign In')) {
+                                    btn.disabled = false;
+                                    btn.classList.remove('mat-mdc-button-disabled');
+                                    btn.removeAttribute('disabled');
                                 }
-                                // Also override getResponse to return our token
-                                if (window.turnstile) {
-                                    try {
-                                        window.turnstile.getResponse = () => token;
-                                        results.push('getResponse_set');
-                                    } catch(e) {}
-                                }
-                                return results;
                             }
-                        """, token)
-                        logger.info("Callback invocation result: %s", cb_result)
-                        callback_invoked = True
-                        # Give Angular time to process token and submit
-                        await page.wait_for_timeout(5000)
-                        continue
+                            const forms = document.querySelectorAll('form');
+                            for (const f of forms) f.noValidate = true;
+                        }
+                    """)
+                    await page.wait_for_timeout(500)
+                    try:
+                        await sign_in.click(force=True)
+                        logger.info("Re-clicked Sign In button")
+                    except Exception as e:
+                        logger.warning("Re-click failed: %s", e)
 
-                    # If turnstile exists but not wrapped, try late-wrapping
-                    if ts_post.get("ts_exists") and not ts_post.get("wrapped") and not callback_invoked:
-                        logger.info("Turnstile not wrapped — late-wrapping + trying getResponse override")
+                    # Re-invoke callback in case Angular needs it again
+                    if token:
                         await page.evaluate("""
                             (token) => {
-                                if (window.turnstile) {
-                                    // Override getResponse to return our token
-                                    window.turnstile.getResponse = function() { return token; };
-                                    // Try to find and invoke any existing callbacks
-                                    // Turnstile stores callbacks internally
-                                    if (typeof window.turnstile.render === 'function' && !window.turnstile.__wrapped) {
-                                        const origRender = window.turnstile.render.bind(window.turnstile);
-                                        window.turnstile.render = function(c, o) {
-                                            console.log('TURNSTILE_LATE_RENDER');
-                                            if (o && o.callback) {
-                                                window.__turnstileCallback = o.callback;
-                                                window.__allTurnstileCallbacks.push(o.callback);
-                                                console.log('TURNSTILE_LATE_CB_CAPTURED');
-                                                // Invoke immediately with our token
-                                                try { o.callback(token); console.log('TURNSTILE_LATE_CB_INVOKED'); }
-                                                catch(e) {}
-                                            }
-                                            try { return origRender(c, o); }
-                                            catch(e) { return 'fw0'; }
-                                        };
-                                        window.turnstile.__wrapped = true;
-                                        console.log('TURNSTILE_LATE_WRAPPED');
-                                    }
+                                if (window.__turnstileCallback) {
+                                    try { window.__turnstileCallback(token); console.log('RECLICK_CB_INVOKED'); }
+                                    catch(e) {}
                                 }
                             }
                         """, token)
 
-                # Log progress every 10s
-                if (nav_wait + 1) % 5 == 0 and not ts_post.get("callback"):
-                    logger.info("Navigation wait %d/45 — URL: %s", nav_wait + 1, current_url)
-
                 await page.wait_for_timeout(2000)
-
-            # If still not navigated, force-enable + re-click + callback invoke
-            if not login_success:
-                logger.info("First click didn't navigate — force-enable + re-click...")
-
-                # Force-enable button
-                await page.evaluate("""
-                    () => {
-                        const allBtns = document.querySelectorAll('button');
-                        for (const btn of allBtns) {
-                            if ((btn.textContent || '').includes('Sign In')) {
-                                btn.disabled = false;
-                                btn.classList.remove('mat-mdc-button-disabled');
-                                btn.removeAttribute('disabled');
-                            }
-                        }
-                        const forms = document.querySelectorAll('form');
-                        for (const f of forms) f.noValidate = true;
-                    }
-                """)
-
-                await page.wait_for_timeout(500)
-                try:
-                    await sign_in.click(force=True)
-                    logger.info("Re-clicked Sign In button")
-
-                    # Wait for callback + navigation after re-click
-                    for retry_wait in range(25):  # 25 × 2s = 50s
-                        if "dashboard" in page.url or "application" in page.url:
-                            login_success = True
-                            logger.info("Dashboard loaded after retry!")
-                            break
-
-                        # Try Turnstile callback again
-                        if not callback_invoked and token:
-                            has_cb = await page.evaluate("() => !!window.__turnstileCallback")
-                            if has_cb:
-                                await page.evaluate("""
-                                    (token) => {
-                                        if (window.__turnstileCallback) window.__turnstileCallback(token);
-                                        for (const cb of (window.__allTurnstileCallbacks || [])) {
-                                            try { cb(token); } catch(e) {}
-                                        }
-                                    }
-                                """, token)
-                                logger.info("Retry: Turnstile callback invoked")
-                                callback_invoked = True
-                                await page.wait_for_timeout(5000)
-                                continue
-
-                        if (retry_wait + 1) % 5 == 0:
-                            logger.info("Retry wait %d/25 — URL: %s", retry_wait + 1, page.url)
-                        await page.wait_for_timeout(2000)
-                except Exception as e:
-                    logger.warning("Re-click failed: %s", e)
 
             if not login_success:
                 current_url = page.url
@@ -1630,6 +1183,7 @@ async def _do_login() -> dict:
             # Unroute to avoid intercepting further requests
             try:
                 await page.unroute("**/lift-api.vfsglobal.com/**")
+                await page.unroute("**/challenges.cloudflare.com/turnstile/v0/api.js*")
             except Exception:
                 pass
 
