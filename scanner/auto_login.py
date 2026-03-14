@@ -168,9 +168,14 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                 except Exception:
                     pass
 
-    # Only route these specific hosts through the upstream proxy
-    # liftassets.vfsglobal.com is just a CDN — no geo-restriction
-    PROXY_DOMAINS = ("visa.vfsglobal.com", "lift-api.vfsglobal.com")
+    # Route these hosts through the upstream proxy.
+    # challenges.cloudflare.com MUST go through the residential proxy too —
+    # Cloudflare's Turnstile API script refuses to initialize from datacenter IPs.
+    PROXY_DOMAINS = (
+        "visa.vfsglobal.com",
+        "lift-api.vfsglobal.com",
+        "challenges.cloudflare.com",
+    )
 
     def _handle(client):
         try:
@@ -453,6 +458,22 @@ async def _do_login() -> dict:
 
         page.on("request", on_request)
 
+        # Monitor responses — especially Turnstile API script loading
+        async def on_response(response):
+            url = response.url
+            if "challenges.cloudflare.com" in url:
+                status = response.status
+                ct = response.headers.get("content-type", "")
+                logger.info("[response] %s — status=%d type=%s", url[:100], status, ct[:40])
+                if "api.js" in url:
+                    try:
+                        body = await response.text()
+                        logger.info("[response] api.js loaded — %d bytes, starts: %s", len(body), body[:80])
+                    except Exception as e:
+                        logger.warning("[response] api.js body read failed: %s", e)
+
+        page.on("response", on_response)
+
         # Capture JS console messages (errors + Turnstile sitekey)
         js_errors = []
 
@@ -712,15 +733,27 @@ async def _do_login() -> dict:
                 # Log detailed status every 9s (every 3rd iteration)
                 if (ts_wait + 1) % 3 == 0:
                     ts_status = await page.evaluate("""
-                        () => ({
-                            turnstileType: typeof window.turnstile,
-                            turnstileHasRender: !!(window.turnstile && window.turnstile.render),
-                            hookCaptured: window.__capturedTurnstileSitekey,
-                            cfDivs: document.querySelectorAll('.cf-turnstile').length,
-                            sitekeyEls: document.querySelectorAll('[data-sitekey]').length,
-                            iframes: Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(s => s),
-                            voltScript: !!document.querySelector('#volt-recaptcha'),
-                        })
+                        () => {
+                            const vs = document.querySelector('#volt-recaptcha');
+                            return {
+                                turnstileType: typeof window.turnstile,
+                                turnstileKeys: window.turnstile ? Object.keys(window.turnstile).slice(0, 10) : [],
+                                hookCaptured: window.__capturedTurnstileSitekey,
+                                cfDivs: document.querySelectorAll('.cf-turnstile').length,
+                                sitekeyEls: document.querySelectorAll('[data-sitekey]').length,
+                                iframes: Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(s => s),
+                                voltScript: vs ? {
+                                    src: vs.src,
+                                    async: vs.async,
+                                    defer: vs.defer,
+                                    type: vs.type,
+                                    readyState: vs.readyState || 'n/a',
+                                } : null,
+                                scriptErrors: Array.from(document.querySelectorAll('script')).filter(s =>
+                                    s.src && s.src.includes('challenges.cloudflare.com')
+                                ).map(s => ({src: s.src, loaded: s.readyState || 'n/a'})),
+                            };
+                        }
                     """)
                     logger.info("Turnstile wait %d/40 — status: %s", ts_wait + 1, ts_status)
                 await page.wait_for_timeout(3000)
