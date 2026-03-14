@@ -1229,101 +1229,100 @@ async def _do_login() -> dict:
             else:
                 logger.warning("No Turnstile sitekey found — proceeding to reCAPTCHA check")
 
-            # ── RECAPTCHA V3 DETECTION AND SOLVING ──
-            # VFS uses reCAPTCHA v3 for login form (via volt-recaptcha script).
-            # Our init script intercepts grecaptcha.execute() — when Angular calls it,
-            # the override captures the sitekey and waits for __recaptchaToken.
-            # We detect the sitekey here, solve via CapSolver, and set the token.
-            recaptcha_token = ""
-            logger.info("Checking for reCAPTCHA v3 (waiting up to 45s)...")
+            # ── TURNSTILE CALLBACK WAIT ──
+            # VFS login CAPTCHA is Turnstile (not reCAPTCHA!) — the #volt-recaptcha
+            # script loads challenges.cloudflare.com/turnstile/v0/api.js.
+            # Our init script wraps turnstile.render() to capture the callback.
+            # Wait briefly for callback to be captured, then try invoking it.
+            # NOTE: Angular may not call render() until Sign In is clicked,
+            # so the main callback invocation happens in the post-click loop.
+            logger.info("Checking for Turnstile callback (pre-click)...")
 
-            for rc_wait in range(23):  # 23 × 2s = 46s
-                rc_state = await page.evaluate("""
+            for cb_wait in range(8):  # 8 × 2s = 16s (short: callback likely comes post-click)
+                ts_state = await page.evaluate("""
                     () => {
-                        const state = {};
-                        state.sitekey = window.__recaptchaSitekey || null;
-                        state.execute_waiting = (window.__recaptchaResolvers || []).length > 0;
-                        state.recaptcha_loaded = !!(window.grecaptcha && typeof window.grecaptcha === 'object');
-                        state.recaptcha_wrapped = !!(window.grecaptcha && window.grecaptcha.__wrapped);
-                        state.token_set = !!window.__recaptchaToken;
-
-                        // Check volt-recaptcha script for sitekey
-                        const voltScript = document.querySelector('#volt-recaptcha, script[id*="recaptcha"]');
-                        if (voltScript) {
-                            state.volt_id = voltScript.id || '';
-                            state.volt_src = (voltScript.src || '').substring(0, 200);
-                            state.volt_content = (voltScript.textContent || '').substring(0, 300);
-                            // Extract sitekey from src render= param
-                            if (voltScript.src) {
-                                const m = voltScript.src.match(/[?&]render=([^&]+)/);
-                                if (m && m[1] !== 'explicit' && !state.sitekey) state.sitekey = m[1];
+                        const s = {};
+                        s.turnstile_exists = typeof window.turnstile !== 'undefined' && window.turnstile !== null;
+                        s.turnstile_type = typeof window.turnstile;
+                        s.turnstile_wrapped = !!(window.turnstile && window.turnstile.__wrapped);
+                        s.callback_captured = !!window.__turnstileCallback;
+                        s.all_callbacks = (window.__allTurnstileCallbacks || []).length;
+                        s.widget_id = window.__turnstileWidgetId || null;
+                        s.captured_sitekey = window.__capturedTurnstileSitekey || null;
+                        s.button_disabled = (() => {
+                            const btns = document.querySelectorAll('button');
+                            for (const b of btns) {
+                                if ((b.textContent || '').includes('Sign In')) return b.disabled;
                             }
-                            // Extract sitekey from inline content
-                            if (voltScript.textContent) {
-                                const m = voltScript.textContent.match(/['"]?(6L[a-zA-Z0-9_-]{30,})['"]?/);
-                                if (m && !state.sitekey) state.sitekey = m[1];
-                            }
+                            return null;
+                        })();
+                        // Check if turnstile exists but wasn't wrapped (init script issue)
+                        if (s.turnstile_exists && !s.turnstile_wrapped && window.turnstile) {
+                            s.turnstile_keys = Object.keys(window.turnstile).slice(0, 10);
                         }
-
-                        // Check any loaded recaptcha scripts
-                        const rcScripts = document.querySelectorAll(
-                            'script[src*="recaptcha"], script[src*="gstatic.com/recaptcha"]');
-                        state.rc_scripts = [];
-                        for (const s of rcScripts) {
-                            state.rc_scripts.push(s.src.substring(0, 120));
-                            const m = s.src.match(/[?&]render=([^&]+)/);
-                            if (m && m[1] !== 'explicit' && !state.sitekey) state.sitekey = m[1];
-                        }
-
-                        return state;
+                        return s;
                     }
                 """)
+                if (cb_wait + 1) % 4 == 0 or ts_state.get("callback_captured"):
+                    logger.info("Turnstile state (%d/8): %s", cb_wait + 1, ts_state)
 
-                if (rc_wait + 1) % 5 == 0 or rc_state.get("sitekey"):
-                    logger.info("reCAPTCHA state (%d/23): %s", rc_wait + 1, rc_state)
+                # If callback captured pre-click, invoke it!
+                if ts_state.get("callback_captured") and token:
+                    logger.info("Turnstile callback captured pre-click — invoking with solved token!")
+                    cb_result = await page.evaluate("""
+                        (token) => {
+                            const results = [];
+                            if (window.__turnstileCallback) {
+                                try { window.__turnstileCallback(token); results.push('main_cb'); }
+                                catch(e) { results.push('err:' + e.message); }
+                            }
+                            for (const cb of (window.__allTurnstileCallbacks || [])) {
+                                try { cb(token); results.push('cb_invoked'); }
+                                catch(e) {}
+                            }
+                            return results;
+                        }
+                    """, token)
+                    logger.info("Pre-click callback invocation: %s", cb_result)
+                    await page.wait_for_timeout(3000)
+                    break
 
-                # Also check Python-side captured sitekey from console
-                if not rc_state.get("sitekey") and captured_recaptcha_sitekey.get("key"):
-                    rc_state["sitekey"] = captured_recaptcha_sitekey["key"]
-                    logger.info("Using reCAPTCHA sitekey from console capture: %s", rc_state["sitekey"])
+                # If button already enabled, we're good
+                if ts_state.get("button_disabled") is False:
+                    logger.info("Sign In button already enabled — skipping callback wait")
+                    break
 
-                sk = rc_state.get("sitekey")
-                if sk:
-                    # Sitekey found — solve it
-                    label = "on-demand (execute waiting)" if rc_state.get("execute_waiting") else "pre-solve"
-                    logger.info("reCAPTCHA sitekey found (%s): %s — solving via CapSolver...", label, sk)
-                    try:
-                        recaptcha_token = solve_recaptcha_v3(
-                            VFS_LOGIN_URL, sk, page_action="login"
-                        )
-                        logger.info("reCAPTCHA v3 solved! Token length: %d", len(recaptcha_token))
-                        await page.evaluate(
-                            "(t) => { window.__recaptchaToken = t; }",
-                            recaptcha_token,
-                        )
-                        logger.info("Set window.__recaptchaToken — execute() override will return it")
-                        # Give Angular time to process the token
-                        await page.wait_for_timeout(3000)
-                        break
-                    except Exception as e:
-                        logger.warning("reCAPTCHA v3 solve failed: %s", e)
-                        break
+                # If turnstile exists but wasn't wrapped, try late-wrapping
+                if ts_state.get("turnstile_exists") and not ts_state.get("turnstile_wrapped"):
+                    logger.info("Turnstile exists but not wrapped — attempting late wrap")
+                    await page.evaluate("""
+                        () => {
+                            if (window.turnstile && typeof window.turnstile.render === 'function' && !window.turnstile.__wrapped) {
+                                const orig = window.turnstile.render.bind(window.turnstile);
+                                window.turnstile.render = function(c, o) {
+                                    console.log('TURNSTILE_LATE_RENDER');
+                                    if (o && o.callback) {
+                                        window.__turnstileCallback = o.callback;
+                                        window.__allTurnstileCallbacks.push(o.callback);
+                                        console.log('TURNSTILE_LATE_CB_CAPTURED');
+                                    }
+                                    if (o && o.sitekey) {
+                                        window.__capturedTurnstileSitekey = o.sitekey;
+                                    }
+                                    try { var r = orig(c, o); window.__turnstileWidgetId = r; return r; }
+                                    catch(e) { return 'fw0'; }
+                                };
+                                window.turnstile.__wrapped = true;
+                                console.log('TURNSTILE_LATE_WRAPPED');
+                            }
+                        }
+                    """)
 
                 await page.wait_for_timeout(2000)
 
-            if not recaptcha_token:
-                logger.info("No reCAPTCHA sitekey detected — will retry on-demand after click")
-
             # Determine best captcha token for route interceptor
-            if recaptcha_token:
-                solved_captcha_token = recaptcha_token
-                captcha_version = "v3"
-            elif token:
-                solved_captcha_token = token
-                captcha_version = "Turnstile"
-            else:
-                solved_captcha_token = ""
-                captcha_version = "v3"  # Default: VFS login uses reCAPTCHA v3
+            solved_captcha_token = token if sitekey else ""
+            captcha_version = "Turnstile"
 
             # ── ROUTE INTERCEPTOR: Inject captcha token into login API POST ──
             # Set up BEFORE form interaction so it's ready when Angular submits.
@@ -1448,12 +1447,13 @@ async def _do_login() -> dict:
             await sign_in.click(force=True)
             logger.info("Clicked Sign In button")
 
-            # ── POST-CLICK: Wait for navigation + on-demand reCAPTCHA solving ──
-            # After clicking Sign In, Angular may call grecaptcha.execute().
-            # Our init script override captures the sitekey and waits for __recaptchaToken.
-            # We poll for this, solve via CapSolver, and set the token to unblock Angular.
-            logger.info("Waiting for post-login navigation (+ monitoring reCAPTCHA)...")
+            # ── POST-CLICK: Wait for navigation + Turnstile callback invocation ──
+            # After clicking Sign In, Angular triggers turnstile.render() which
+            # our init script wrapper captures. We poll for the callback and
+            # invoke it with our CapSolver-solved token.
+            logger.info("Waiting for post-login navigation (+ monitoring Turnstile callback)...")
             login_success = False
+            callback_invoked = False
 
             for nav_wait in range(45):  # 45 × 2s = 90s max
                 current_url = page.url
@@ -1473,55 +1473,106 @@ async def _do_login() -> dict:
                 except Exception:
                     pass
 
-                # On-demand reCAPTCHA solving (if not already solved)
-                if not recaptcha_token:
-                    rc_state = await page.evaluate("""
+                # ── Turnstile callback invocation (THE KEY STEP) ──
+                # Angular calls turnstile.render() after we click Sign In.
+                # Our wrapper captures the callback. Invoke it with our token.
+                if not callback_invoked and token:
+                    ts_post = await page.evaluate("""
                         () => ({
-                            sitekey: window.__recaptchaSitekey || null,
-                            waiting: (window.__recaptchaResolvers || []).length > 0,
-                            token_set: !!window.__recaptchaToken,
+                            callback: !!window.__turnstileCallback,
+                            all_cbs: (window.__allTurnstileCallbacks || []).length,
+                            wrapped: !!(window.turnstile && window.turnstile.__wrapped),
+                            ts_exists: typeof window.turnstile !== 'undefined' && window.turnstile !== null,
+                            widget_id: window.__turnstileWidgetId || null,
+                            btn_disabled: (() => {
+                                const btns = document.querySelectorAll('button');
+                                for (const b of btns) {
+                                    if ((b.textContent || '').includes('Sign In')) return b.disabled;
+                                }
+                                return null;
+                            })(),
                         })
                     """)
 
-                    # Also check Python-captured sitekey
-                    sk = rc_state.get("sitekey") or captured_recaptcha_sitekey.get("key")
+                    if (nav_wait + 1) % 5 == 0:
+                        logger.info("Post-click Turnstile state (%d/45): %s", nav_wait + 1, ts_post)
 
-                    if sk and (rc_state.get("waiting") or True) and not rc_state.get("token_set"):
-                        logger.info(
-                            "reCAPTCHA detected post-click! sitekey=%s waiting=%s — solving...",
-                            sk, rc_state.get("waiting"),
-                        )
-                        try:
-                            recaptcha_token = solve_recaptcha_v3(
-                                VFS_LOGIN_URL, sk, page_action="login"
-                            )
-                            logger.info("On-demand reCAPTCHA solved! Token length: %d", len(recaptcha_token))
-                            await page.evaluate(
-                                "(t) => { window.__recaptchaToken = t; }",
-                                recaptcha_token,
-                            )
-                            logger.info("Set __recaptchaToken — Angular should proceed")
-                            solved_captcha_token = recaptcha_token
-                            captcha_version = "v3"
-                            # Give Angular time to process and submit
-                            await page.wait_for_timeout(5000)
-                            continue
-                        except Exception as e:
-                            logger.warning("On-demand reCAPTCHA solve failed: %s", e)
+                    if ts_post.get("callback"):
+                        logger.info("TURNSTILE CALLBACK CAPTURED! Invoking with solved token...")
+                        cb_result = await page.evaluate("""
+                            (token) => {
+                                const results = [];
+                                try {
+                                    if (window.__turnstileCallback) {
+                                        window.__turnstileCallback(token);
+                                        results.push('main_cb_invoked');
+                                    }
+                                } catch(e) { results.push('main_err:' + e.message); }
+                                for (const cb of (window.__allTurnstileCallbacks || [])) {
+                                    try { cb(token); results.push('cb_ok'); }
+                                    catch(e) { results.push('cb_err:' + e.message); }
+                                }
+                                // Also override getResponse to return our token
+                                if (window.turnstile) {
+                                    try {
+                                        window.turnstile.getResponse = () => token;
+                                        results.push('getResponse_set');
+                                    } catch(e) {}
+                                }
+                                return results;
+                            }
+                        """, token)
+                        logger.info("Callback invocation result: %s", cb_result)
+                        callback_invoked = True
+                        # Give Angular time to process token and submit
+                        await page.wait_for_timeout(5000)
+                        continue
+
+                    # If turnstile exists but not wrapped, try late-wrapping
+                    if ts_post.get("ts_exists") and not ts_post.get("wrapped") and not callback_invoked:
+                        logger.info("Turnstile not wrapped — late-wrapping + trying getResponse override")
+                        await page.evaluate("""
+                            (token) => {
+                                if (window.turnstile) {
+                                    // Override getResponse to return our token
+                                    window.turnstile.getResponse = function() { return token; };
+                                    // Try to find and invoke any existing callbacks
+                                    // Turnstile stores callbacks internally
+                                    if (typeof window.turnstile.render === 'function' && !window.turnstile.__wrapped) {
+                                        const origRender = window.turnstile.render.bind(window.turnstile);
+                                        window.turnstile.render = function(c, o) {
+                                            console.log('TURNSTILE_LATE_RENDER');
+                                            if (o && o.callback) {
+                                                window.__turnstileCallback = o.callback;
+                                                window.__allTurnstileCallbacks.push(o.callback);
+                                                console.log('TURNSTILE_LATE_CB_CAPTURED');
+                                                // Invoke immediately with our token
+                                                try { o.callback(token); console.log('TURNSTILE_LATE_CB_INVOKED'); }
+                                                catch(e) {}
+                                            }
+                                            try { return origRender(c, o); }
+                                            catch(e) { return 'fw0'; }
+                                        };
+                                        window.turnstile.__wrapped = true;
+                                        console.log('TURNSTILE_LATE_WRAPPED');
+                                    }
+                                }
+                            }
+                        """, token)
 
                 # Log progress every 10s
-                if (nav_wait + 1) % 5 == 0:
+                if (nav_wait + 1) % 5 == 0 and not ts_post.get("callback"):
                     logger.info("Navigation wait %d/45 — URL: %s", nav_wait + 1, current_url)
 
                 await page.wait_for_timeout(2000)
 
-            # If still not navigated, try deep Angular patch + re-click
+            # If still not navigated, force-enable + re-click + callback invoke
             if not login_success:
-                logger.info("First click didn't navigate — trying force-enable + re-click...")
+                logger.info("First click didn't navigate — force-enable + re-click...")
 
+                # Force-enable button
                 await page.evaluate("""
-                    (token) => {
-                        // Force-enable Sign In button
+                    () => {
                         const allBtns = document.querySelectorAll('button');
                         for (const btn of allBtns) {
                             if ((btn.textContent || '').includes('Sign In')) {
@@ -1530,43 +1581,42 @@ async def _do_login() -> dict:
                                 btn.removeAttribute('disabled');
                             }
                         }
-                        // Set forms to noValidate
                         const forms = document.querySelectorAll('form');
                         for (const f of forms) f.noValidate = true;
                     }
-                """, solved_captcha_token)
+                """)
 
                 await page.wait_for_timeout(500)
                 try:
                     await sign_in.click(force=True)
                     logger.info("Re-clicked Sign In button")
 
-                    # Wait for reCAPTCHA on-demand or navigation
-                    for retry_wait in range(20):  # 20 × 2s = 40s
+                    # Wait for callback + navigation after re-click
+                    for retry_wait in range(25):  # 25 × 2s = 50s
                         if "dashboard" in page.url or "application" in page.url:
                             login_success = True
                             logger.info("Dashboard loaded after retry!")
                             break
 
-                        # On-demand reCAPTCHA (retry)
-                        if not recaptcha_token:
-                            sk = await page.evaluate("() => window.__recaptchaSitekey")
-                            sk = sk or captured_recaptcha_sitekey.get("key")
-                            if sk:
-                                try:
-                                    recaptcha_token = solve_recaptcha_v3(
-                                        VFS_LOGIN_URL, sk, page_action="login"
-                                    )
-                                    await page.evaluate(
-                                        "(t) => { window.__recaptchaToken = t; }",
-                                        recaptcha_token,
-                                    )
-                                    logger.info("Retry reCAPTCHA solved! Token length: %d", len(recaptcha_token))
-                                    await page.wait_for_timeout(5000)
-                                    continue
-                                except Exception as e:
-                                    logger.warning("Retry reCAPTCHA failed: %s", e)
+                        # Try Turnstile callback again
+                        if not callback_invoked and token:
+                            has_cb = await page.evaluate("() => !!window.__turnstileCallback")
+                            if has_cb:
+                                await page.evaluate("""
+                                    (token) => {
+                                        if (window.__turnstileCallback) window.__turnstileCallback(token);
+                                        for (const cb of (window.__allTurnstileCallbacks || [])) {
+                                            try { cb(token); } catch(e) {}
+                                        }
+                                    }
+                                """, token)
+                                logger.info("Retry: Turnstile callback invoked")
+                                callback_invoked = True
+                                await page.wait_for_timeout(5000)
+                                continue
 
+                        if (retry_wait + 1) % 5 == 0:
+                            logger.info("Retry wait %d/25 — URL: %s", retry_wait + 1, page.url)
                         await page.wait_for_timeout(2000)
                 except Exception as e:
                     logger.warning("Re-click failed: %s", e)
