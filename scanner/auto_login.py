@@ -639,30 +639,52 @@ async def _do_login() -> dict:
                 await _log_page_debug(page, "password-not-found")
                 raise RuntimeError("Could not find password input field")
 
-            # Click sign in — VFS uses role=button "Sign In"
-            sign_in_btn = page.get_by_role("button", name="Sign In")
-            try:
-                await sign_in_btn.click(timeout=5000)
-                logger.info("Clicked Sign In button")
-            except Exception:
-                # Fallback to other selectors
-                submit_selectors = [
-                    'button[type="submit"]',
-                    'button:has-text("Sign In")',
-                    'button:has-text("Login")',
-                    'button:has-text("Log In")',
-                ]
-                submitted = False
-                for sel in submit_selectors:
-                    try:
-                        await page.click(sel, timeout=5000)
-                        submitted = True
-                        logger.info("Clicked submit using selector: %s", sel)
-                        break
-                    except Exception:
-                        continue
-                if not submitted:
-                    raise RuntimeError("Could not find submit button")
+            # Click sign in — wait for button to be ready (VFS is slow)
+            logger.info("Looking for Sign In button...")
+            submit_selectors = [
+                ('role', "button", "Sign In"),
+                ('css', 'button[type="submit"]'),
+                ('css', 'button:has-text("Sign In")'),
+                ('css', 'button:has-text("Login")'),
+                ('css', 'button:has-text("Log In")'),
+                ('css', 'button:has-text("SIGN IN")'),
+                ('css', 'button.mat-raised-button'),
+                ('css', 'button.mat-flat-button'),
+                ('css', 'form button'),
+            ]
+            submitted = False
+            for entry in submit_selectors:
+                try:
+                    if entry[0] == 'role':
+                        locator = page.get_by_role(entry[1], name=entry[2])
+                        await locator.wait_for(timeout=5000)
+                        await locator.click()
+                        logger.info("Clicked submit via role: %s", entry[2])
+                    else:
+                        locator = page.locator(entry[1])
+                        await locator.first.wait_for(timeout=5000)
+                        await locator.first.click()
+                        logger.info("Clicked submit via selector: %s", entry[1])
+                    submitted = True
+                    break
+                except Exception:
+                    continue
+
+            if not submitted:
+                # Debug: log all buttons on page
+                btn_info = await page.evaluate("""
+                    () => {
+                        const btns = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                        return Array.from(btns).map(b => ({
+                            tag: b.tagName, type: b.type, text: b.textContent.trim().substring(0, 50),
+                            class: b.className, id: b.id, disabled: b.disabled,
+                            visible: b.offsetParent !== null
+                        }));
+                    }
+                """)
+                logger.error("Submit not found! All buttons on page: %s", btn_info)
+                await _log_page_debug(page, "submit-not-found")
+                raise RuntimeError("Could not find submit button")
 
             # Wait for post-login page (dashboard or "Start New Booking" button)
             logger.info("Waiting for post-login page...")
