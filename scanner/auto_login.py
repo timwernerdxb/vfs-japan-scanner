@@ -518,26 +518,18 @@ async def _do_login() -> dict:
                 )
 
             # Dismiss cookie consent banner (OneTrust)
-            # VFS uses OneTrust — the banner blocks form interaction
-            logger.info("Checking for cookie consent banner...")
-            try:
-                reject_btn = page.get_by_role("button", name="Reject All")
-                if await reject_btn.is_visible(timeout=5000):
-                    await reject_btn.click()
-                    logger.info("Cookie banner dismissed (Reject All)")
+            # VFS uses OneTrust — must dismiss before form interaction
+            logger.info("Dismissing cookie consent banner...")
+            for sel in ["#onetrust-reject-all-handler", "#onetrust-accept-btn-handler"]:
+                try:
+                    btn = page.locator(sel)
+                    await btn.wait_for(state="visible", timeout=5000)
+                    await btn.click()
+                    logger.info("Cookie banner dismissed via %s", sel)
                     await page.wait_for_timeout(1000)
-            except Exception:
-                # Also try OneTrust-specific selectors
-                for sel in ["#onetrust-reject-all-handler", "#onetrust-accept-btn-handler"]:
-                    try:
-                        btn = page.locator(sel)
-                        if await btn.is_visible(timeout=2000):
-                            await btn.click()
-                            logger.info("Cookie banner dismissed via %s", sel)
-                            await page.wait_for_timeout(1000)
-                            break
-                    except Exception:
-                        continue
+                    break
+                except Exception:
+                    continue
 
             # Solve Turnstile
             try:
@@ -639,52 +631,43 @@ async def _do_login() -> dict:
                 await _log_page_debug(page, "password-not-found")
                 raise RuntimeError("Could not find password input field")
 
-            # Click sign in — wait for button to be ready (VFS is slow)
+            # Click Sign In button
+            # The button starts disabled (waiting for Turnstile CAPTCHA to solve).
+            # Wait up to 45s for it to become enabled, then force-enable if needed.
             logger.info("Looking for Sign In button...")
-            submit_selectors = [
-                ('role', "button", "Sign In"),
-                ('css', 'button[type="submit"]'),
-                ('css', 'button:has-text("Sign In")'),
-                ('css', 'button:has-text("Login")'),
-                ('css', 'button:has-text("Log In")'),
-                ('css', 'button:has-text("SIGN IN")'),
-                ('css', 'button.mat-raised-button'),
-                ('css', 'button.mat-flat-button'),
-                ('css', 'form button'),
-            ]
-            submitted = False
-            for entry in submit_selectors:
-                try:
-                    if entry[0] == 'role':
-                        locator = page.get_by_role(entry[1], name=entry[2])
-                        await locator.wait_for(timeout=5000)
-                        await locator.click()
-                        logger.info("Clicked submit via role: %s", entry[2])
-                    else:
-                        locator = page.locator(entry[1])
-                        await locator.first.wait_for(timeout=5000)
-                        await locator.first.click()
-                        logger.info("Clicked submit via selector: %s", entry[1])
-                    submitted = True
-                    break
-                except Exception:
-                    continue
-
-            if not submitted:
-                # Debug: log all buttons on page
-                btn_info = await page.evaluate("""
-                    () => {
-                        const btns = document.querySelectorAll('button, [role="button"], input[type="submit"]');
-                        return Array.from(btns).map(b => ({
-                            tag: b.tagName, type: b.type, text: b.textContent.trim().substring(0, 50),
-                            class: b.className, id: b.id, disabled: b.disabled,
-                            visible: b.offsetParent !== null
-                        }));
-                    }
-                """)
-                logger.error("Submit not found! All buttons on page: %s", btn_info)
+            sign_in = page.locator('button[type="submit"]:has-text("Sign In")')
+            try:
+                await sign_in.wait_for(state="visible", timeout=10000)
+                logger.info("Sign In button found (visible)")
+            except Exception:
+                logger.error("Sign In button not found on page")
                 await _log_page_debug(page, "submit-not-found")
                 raise RuntimeError("Could not find submit button")
+
+            # Wait for button to become enabled (Turnstile solving in background)
+            for wait_i in range(9):  # 9 × 5s = 45s max
+                is_disabled = await sign_in.is_disabled()
+                if not is_disabled:
+                    logger.info("Sign In button is enabled!")
+                    break
+                logger.info("Sign In button still disabled (%d/9)...", wait_i + 1)
+                await page.wait_for_timeout(5000)
+            else:
+                # Button stayed disabled after 45s — force-enable via JS
+                logger.warning("Sign In button still disabled after 45s — force-enabling")
+                await page.evaluate("""
+                    () => {
+                        const btn = document.querySelector('button[type="submit"]');
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.classList.remove('mat-mdc-button-disabled');
+                        }
+                    }
+                """)
+                await page.wait_for_timeout(500)
+
+            await sign_in.click(force=True)
+            logger.info("Clicked Sign In button")
 
             # Wait for post-login page (dashboard or "Start New Booking" button)
             logger.info("Waiting for post-login page...")
