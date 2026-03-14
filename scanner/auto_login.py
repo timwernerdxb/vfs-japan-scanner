@@ -590,7 +590,19 @@ async def _do_login() -> dict:
             # Small pause after email fill — some forms reveal password after email
             await page.wait_for_timeout(2000)
 
-            # Fill password
+            # Fill password — VFS is slow, so first wait for ANY password-like
+            # input to appear (up to 30s), then try specific selectors quickly
+            logger.info("Waiting for password field to appear...")
+            try:
+                await page.wait_for_selector(
+                    'input[type="password"], input[placeholder*="assword"], '
+                    'input[formcontrolname="password"], #mat-input-1',
+                    timeout=30000,
+                )
+                logger.info("Password field appeared")
+            except Exception:
+                logger.warning("No password field after 30s — trying selectors anyway")
+
             password_selectors = [
                 "#mat-input-1",
                 'input[type="password"]',
@@ -603,7 +615,7 @@ async def _do_login() -> dict:
             for sel in password_selectors:
                 try:
                     locator = page.locator(sel)
-                    await locator.wait_for(timeout=5000)
+                    await locator.wait_for(timeout=3000)
                     await locator.fill(VFS_PASSWORD)
                     password_filled = True
                     logger.info("Password filled using selector: %s", sel)
