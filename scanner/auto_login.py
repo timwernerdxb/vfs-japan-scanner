@@ -850,94 +850,250 @@ async def _do_login() -> dict:
             token = ""  # Will be set if sitekey found and CapSolver succeeds
             if sitekey:
                 try:
-                    # Check if our getter/setter trap captured the callback
-                    callback_status = await page.evaluate("""
-                        () => ({
-                            hasCallback: !!window.__turnstileCallback,
-                            callbackType: typeof window.__turnstileCallback,
-                            totalCallbacks: window.__allTurnstileCallbacks ? window.__allTurnstileCallbacks.length : 0,
-                            capturedSitekey: window.__capturedTurnstileSitekey,
-                            widgetId: window.__turnstileWidgetId,
-                            turnstileExists: !!window.turnstile,
-                            turnstileWrapped: !!(window.turnstile && window.turnstile.__wrapped),
-                            turnstileType: typeof window.turnstile,
-                        })
+                    # ── DIAGNOSTIC: Understand Angular state before injection ──
+                    diag = await page.evaluate("""
+                        () => {
+                            const r = {};
+
+                            // Angular globals
+                            r.ng_exists = typeof ng !== 'undefined';
+                            r.ng_getComponent = typeof ng !== 'undefined' && typeof ng.getComponent === 'function';
+                            r.getAllRoots = typeof getAllAngularRootElements === 'function';
+                            r.Zone = typeof Zone !== 'undefined';
+
+                            // Check __ngContext__ on elements
+                            r.ngCtx = [];
+                            const all = document.querySelectorAll('*');
+                            for (const el of all) {
+                                if (el.__ngContext__ !== undefined && el.__ngContext__ !== null) {
+                                    r.ngCtx.push({
+                                        tag: el.tagName.toLowerCase(),
+                                        id: (el.id || '').substring(0, 20),
+                                        type: typeof el.__ngContext__,
+                                        isArr: Array.isArray(el.__ngContext__),
+                                        val: typeof el.__ngContext__ === 'number' ? el.__ngContext__ : null,
+                                        len: Array.isArray(el.__ngContext__) ? el.__ngContext__.length : null,
+                                    });
+                                }
+                                if (r.ngCtx.length >= 10) break;
+                            }
+
+                            // formcontrolname elements (critical for form patching)
+                            r.formControls = [];
+                            const fcn = document.querySelectorAll('[formcontrolname]');
+                            for (const el of fcn) {
+                                r.formControls.push({
+                                    tag: el.tagName.toLowerCase(),
+                                    fcn: el.getAttribute('formcontrolname'),
+                                    type: el.type || '',
+                                    val: (el.value || '').substring(0, 20),
+                                });
+                            }
+
+                            // Buttons
+                            r.buttons = [];
+                            const btns = document.querySelectorAll('button');
+                            for (const b of btns) {
+                                const txt = (b.textContent || '').trim().substring(0, 30);
+                                if (txt) {
+                                    r.buttons.push({
+                                        type: b.type, text: txt, disabled: b.disabled,
+                                    });
+                                }
+                            }
+
+                            // reCAPTCHA / Turnstile state
+                            r.grecaptcha = typeof grecaptcha !== 'undefined';
+                            r.turnstile_type = typeof window.turnstile;
+                            r.turnstile_wrapped = !!(window.turnstile && window.turnstile.__wrapped);
+                            r.callback_captured = !!window.__turnstileCallback;
+                            r.recaptchaEls = document.querySelectorAll('.g-recaptcha, [data-sitekey]').length;
+                            r.turnstileEls = document.querySelectorAll('.cf-turnstile, [data-turnstile-sitekey]').length;
+
+                            // Check Symbol properties on elements (Angular might use Symbols)
+                            r.symbolProps = [];
+                            try {
+                                const formEl = document.querySelector('form');
+                                if (formEl) {
+                                    const syms = Object.getOwnPropertySymbols(formEl);
+                                    r.symbolProps = syms.map(s => s.toString()).slice(0, 5);
+                                }
+                            } catch(e) {}
+
+                            return r;
+                        }
                     """)
-                    logger.info("Turnstile trap status: %s", callback_status)
+                    logger.info("Angular diagnostic: %s", diag)
 
                     logger.info("Requesting CapSolver to solve Turnstile...")
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
-                    # === STRATEGY 1: Call captured Turnstile callback ===
-                    # Our init script's getter/setter trap should have captured
-                    # the callback when Angular called turnstile.render().
-                    # Calling it triggers Angular's patchCaptchaValue() which
-                    # sets captcha_api_key + captcha_version → form becomes valid.
-                    callback_result = await page.evaluate("""
+                    # === MULTI-STRATEGY CAPTCHA TOKEN INJECTION ===
+                    inject_result = await page.evaluate("""
                         (token) => {
                             const results = [];
-                            results.push('hasCallback:' + !!window.__turnstileCallback);
-                            results.push('totalCallbacks:' + (window.__allTurnstileCallbacks?.length || 0));
-                            results.push('hasTurnstile:' + !!window.turnstile);
-                            results.push('turnstileWrapped:' + !!(window.turnstile && window.turnstile.__wrapped));
+                            let loginFormGroup = null;
+                            let loginComponent = null;
 
+                            // Helper: patch a found FormGroup
+                            function patchFormGroup(fg, comp, source) {
+                                results.push('FOUND_FORM:' + source);
+                                const cKeys = Object.keys(fg.controls);
+                                results.push('controls=' + cKeys.join(','));
+
+                                // Set captcha_api_key
+                                if (fg.controls.captcha_api_key) {
+                                    fg.controls.captcha_api_key.setValue(token);
+                                    if (fg.controls.captcha_api_key.clearValidators)
+                                        fg.controls.captcha_api_key.clearValidators();
+                                    fg.controls.captcha_api_key.setErrors(null);
+                                    fg.controls.captcha_api_key.updateValueAndValidity();
+                                    results.push('SET_captcha_api_key');
+                                }
+
+                                // Set captcha_version
+                                if (fg.controls.captcha_version) {
+                                    let version = 'Turnstile';
+                                    if (comp) {
+                                        const compProps = Object.getOwnPropertyNames(comp);
+                                        for (const cp of compProps) {
+                                            try {
+                                                const cv = comp[cp];
+                                                if (cv && typeof cv === 'object' &&
+                                                    (cv.cloudflare || cv.alternate || cv.default)) {
+                                                    version = cv.cloudflare || cv.alternate || version;
+                                                    results.push('version_const=' + cp + ':' + version);
+                                                    break;
+                                                }
+                                            } catch(e) {}
+                                        }
+                                    }
+                                    fg.controls.captcha_version.setValue(version);
+                                    if (fg.controls.captcha_version.clearValidators)
+                                        fg.controls.captcha_version.clearValidators();
+                                    fg.controls.captcha_version.setErrors(null);
+                                    fg.controls.captcha_version.updateValueAndValidity();
+                                    results.push('SET_captcha_version:' + version);
+                                }
+
+                                // Clear validators on ALL captcha-related controls
+                                for (const cn of cKeys) {
+                                    const lower = cn.toLowerCase();
+                                    if (lower.includes('captcha') || lower.includes('token') ||
+                                        lower.includes('turnstile') || lower.includes('otp')) {
+                                        const ctrl = fg.controls[cn];
+                                        if (ctrl.clearValidators) ctrl.clearValidators();
+                                        ctrl.setErrors(null);
+                                        ctrl.updateValueAndValidity();
+                                        results.push('cleared:' + cn);
+                                    }
+                                }
+
+                                fg.updateValueAndValidity();
+                                results.push('form_valid:' + fg.valid);
+                                results.push('form_status:' + fg.status);
+                            }
+
+                            // Helper: check if an object is a FormGroup with login controls
+                            function isLoginFormGroup(obj) {
+                                if (!obj || typeof obj !== 'object') return false;
+                                if (!obj.controls || typeof obj.controls !== 'object') return false;
+                                const keys = Object.keys(obj.controls);
+                                return keys.includes('username') || keys.includes('password') ||
+                                       keys.includes('captcha_api_key');
+                            }
+
+                            // === STRATEGY 1: Captured Turnstile callback ===
                             if (window.__turnstileCallback) {
                                 try {
                                     window.__turnstileCallback(token);
-                                    results.push('CALLBACK_INVOKED');
+                                    results.push('S1_CALLBACK_INVOKED');
                                 } catch(e) {
-                                    results.push('callback_error:' + e.message);
+                                    results.push('s1_err:' + e.message);
                                 }
                             }
-                            // Also try all captured callbacks (in case multiple renders)
                             if (window.__allTurnstileCallbacks) {
                                 for (let i = 0; i < window.__allTurnstileCallbacks.length; i++) {
                                     try {
                                         window.__allTurnstileCallbacks[i](token);
-                                        results.push('CALLBACK_' + i + '_INVOKED');
+                                        results.push('S1_CB_' + i);
                                     } catch(e) {}
                                 }
                             }
-                            return results;
-                        }
-                    """, token)
-                    logger.info("Callback invocation results: %s", callback_result)
 
-                    # Wait for Angular change detection to process the callback
-                    await page.wait_for_timeout(2000)
+                            // === STRATEGY 2: Angular ng.getComponent() API ===
+                            // Works in production mode — walks UP from form elements
+                            if (typeof ng !== 'undefined' && typeof ng.getComponent === 'function') {
+                                results.push('S2_ng_available');
+                                const formEls = document.querySelectorAll(
+                                    '[formcontrolname], form, app-login, [class*=login]');
+                                for (const el of formEls) {
+                                    let current = el;
+                                    while (current && !loginFormGroup) {
+                                        try {
+                                            const comp = ng.getComponent(current);
+                                            if (comp) {
+                                                results.push('S2_comp_at:' + current.tagName.toLowerCase());
+                                                const props = Object.getOwnPropertyNames(comp);
+                                                for (const p of props) {
+                                                    try {
+                                                        if (isLoginFormGroup(comp[p])) {
+                                                            loginFormGroup = comp[p];
+                                                            loginComponent = comp;
+                                                            patchFormGroup(loginFormGroup, loginComponent, 'ng_api');
+                                                            break;
+                                                        }
+                                                    } catch(e) {}
+                                                }
+                                            }
+                                        } catch(e) {}
+                                        current = current.parentElement;
+                                    }
+                                    if (loginFormGroup) break;
+                                }
+                            } else {
+                                results.push('S2_ng_not_available');
+                            }
 
-                    # Check if button is now enabled (callback worked)
-                    btn_enabled_after_cb = await page.evaluate("""
-                        () => {
-                            const btn = document.querySelector('button[type="submit"]');
-                            return btn ? !btn.disabled : null;
-                        }
-                    """)
-                    logger.info("Button enabled after callback: %s", btn_enabled_after_cb)
-
-                    # === STRATEGY 2: Angular LView search (minification-safe) ===
-                    # Production builds minify property names (loginForm → a, xY, etc.)
-                    # So we search ALL properties of ALL objects in LViews for a
-                    # FormGroup with controls named username/password/captcha_api_key
-                    if not btn_enabled_after_cb:
-                        logger.info("Callback didn't enable button — trying LView search...")
-                        inject_result = await page.evaluate("""
-                            (token) => {
-                                const results = [];
-                                let loginFormGroup = null;
-                                let loginComponent = null;
-
-                                // Collect all LViews from DOM elements
+                            // === STRATEGY 3: LView search (handles numeric __ngContext__) ===
+                            if (!loginFormGroup) {
                                 const lViews = new Set();
                                 const allElements = document.querySelectorAll('*');
+
+                                // Collect array contexts
                                 for (const el of allElements) {
                                     const ctx = el.__ngContext__;
                                     if (Array.isArray(ctx) && ctx.length > 5) {
                                         lViews.add(ctx);
                                     }
                                 }
-                                // Also check Angular root elements
+
+                                // For numeric contexts, find parent LView
+                                // In Angular 17+, numeric __ngContext__ = index in parent LView
+                                // The parent LView is on a parent element
+                                if (lViews.size === 0) {
+                                    results.push('S3_no_array_ctx');
+                                    // Try to find LView via numeric context chain
+                                    for (const el of allElements) {
+                                        const ctx = el.__ngContext__;
+                                        if (typeof ctx === 'number') {
+                                            // Walk up to find array context
+                                            let parent = el.parentElement;
+                                            while (parent) {
+                                                const pCtx = parent.__ngContext__;
+                                                if (Array.isArray(pCtx) && pCtx.length > 5) {
+                                                    lViews.add(pCtx);
+                                                    break;
+                                                }
+                                                parent = parent.parentElement;
+                                            }
+                                        }
+                                        if (lViews.size > 0) break;
+                                    }
+                                }
+
+                                // Also try getAllAngularRootElements
                                 try {
                                     const roots = typeof getAllAngularRootElements === 'function'
                                         ? getAllAngularRootElements() : [];
@@ -946,28 +1102,24 @@ async def _do_login() -> dict:
                                     }
                                 } catch(e) {}
 
-                                results.push('lviews_found:' + lViews.size);
+                                results.push('S3_lviews:' + lViews.size);
 
                                 // Recursively collect nested LViews
-                                function collectNested(arr, depth) {
-                                    if (depth > 3) return;
-                                    for (let i = 0; i < arr.length; i++) {
-                                        const item = arr[i];
-                                        if (Array.isArray(item) && item.length > 5 && !lViews.has(item)) {
-                                            lViews.add(item);
-                                            collectNested(item, depth + 1);
-                                        }
-                                    }
-                                }
                                 for (const lv of [...lViews]) {
-                                    collectNested(lv, 0);
+                                    (function nest(arr, d) {
+                                        if (d > 4) return;
+                                        for (let i = 0; i < arr.length; i++) {
+                                            if (Array.isArray(arr[i]) && arr[i].length > 5 && !lViews.has(arr[i])) {
+                                                lViews.add(arr[i]);
+                                                nest(arr[i], d + 1);
+                                            }
+                                        }
+                                    })(lv, 0);
                                 }
-                                results.push('lviews_after_nesting:' + lViews.size);
 
-                                // Search each LView for component with a FormGroup
-                                // Property names are minified, so check ALL props of ALL objects
+                                // Search LViews for component with FormGroup
                                 for (const lView of lViews) {
-                                    for (let i = 0; i < Math.min(lView.length, 100); i++) {
+                                    for (let i = 0; i < Math.min(lView.length, 120); i++) {
                                         const item = lView[i];
                                         if (!item || typeof item !== 'object') continue;
                                         if (item instanceof Node || item instanceof Window) continue;
@@ -977,22 +1129,10 @@ async def _do_login() -> dict:
                                             const props = Object.getOwnPropertyNames(item).slice(0, 80);
                                             for (const prop of props) {
                                                 try {
-                                                    const val = item[prop];
-                                                    if (!val || typeof val !== 'object') continue;
-                                                    if (val instanceof Node || Array.isArray(val)) continue;
-                                                    if (typeof val.controls !== 'object' || !val.controls) continue;
-
-                                                    const cKeys = Object.keys(val.controls);
-                                                    const hasLogin = cKeys.includes('username') ||
-                                                                     cKeys.includes('password') ||
-                                                                     cKeys.includes('captcha_api_key');
-                                                    if (hasLogin) {
-                                                        loginFormGroup = val;
+                                                    if (isLoginFormGroup(item[prop])) {
+                                                        loginFormGroup = item[prop];
                                                         loginComponent = item;
-                                                        results.push('FOUND_FORM_VIA_LVIEW');
-                                                        results.push('prop=' + prop);
-                                                        results.push('lview_idx=' + i);
-                                                        results.push('controls=' + cKeys.join(','));
+                                                        patchFormGroup(loginFormGroup, loginComponent, 'lview');
                                                         break;
                                                     }
                                                 } catch(e) {}
@@ -1002,96 +1142,57 @@ async def _do_login() -> dict:
                                     }
                                     if (loginFormGroup) break;
                                 }
-
-                                // Patch the FormGroup if found
-                                if (loginFormGroup) {
-                                    const cKeys = Object.keys(loginFormGroup.controls);
-
-                                    // Set captcha_api_key
-                                    if (loginFormGroup.controls.captcha_api_key) {
-                                        loginFormGroup.controls.captcha_api_key.setValue(token);
-                                        if (loginFormGroup.controls.captcha_api_key.clearValidators)
-                                            loginFormGroup.controls.captcha_api_key.clearValidators();
-                                        loginFormGroup.controls.captcha_api_key.setErrors(null);
-                                        loginFormGroup.controls.captcha_api_key.updateValueAndValidity();
-                                        results.push('SET_captcha_api_key');
-                                    }
-
-                                    // Set captcha_version
-                                    if (loginFormGroup.controls.captcha_version) {
-                                        // Try getting version from component's captchaVersionConst
-                                        let version = 'Turnstile';
-                                        if (loginComponent) {
-                                            // Search minified component for captchaVersionConst
-                                            const compProps = Object.getOwnPropertyNames(loginComponent);
-                                            for (const cp of compProps) {
-                                                try {
-                                                    const cv = loginComponent[cp];
-                                                    if (cv && typeof cv === 'object' &&
-                                                        (cv.cloudflare || cv.alternate || cv.default)) {
-                                                        version = cv.cloudflare || cv.alternate || version;
-                                                        results.push('version_const_prop=' + cp);
-                                                        break;
-                                                    }
-                                                } catch(e) {}
-                                            }
-                                        }
-                                        loginFormGroup.controls.captcha_version.setValue(version);
-                                        if (loginFormGroup.controls.captcha_version.clearValidators)
-                                            loginFormGroup.controls.captcha_version.clearValidators();
-                                        loginFormGroup.controls.captcha_version.setErrors(null);
-                                        loginFormGroup.controls.captcha_version.updateValueAndValidity();
-                                        results.push('SET_captcha_version:' + version);
-                                    }
-
-                                    // Clear validators on ALL captcha-related controls
-                                    for (const cn of cKeys) {
-                                        const lower = cn.toLowerCase();
-                                        if (lower.includes('captcha') || lower.includes('token') ||
-                                            lower.includes('turnstile') || lower.includes('otp')) {
-                                            const ctrl = loginFormGroup.controls[cn];
-                                            if (ctrl.clearValidators) ctrl.clearValidators();
-                                            ctrl.setErrors(null);
-                                            ctrl.updateValueAndValidity();
-                                            results.push('cleared:' + cn);
-                                        }
-                                    }
-
-                                    loginFormGroup.updateValueAndValidity();
-                                    results.push('form_valid:' + loginFormGroup.valid);
-                                    results.push('form_status:' + loginFormGroup.status);
-                                }
-
-                                // === FALLBACK: Set hidden inputs ===
-                                const names = ['cf-turnstile-response', 'g-recaptcha-response'];
-                                for (const name of names) {
-                                    const input = document.querySelector('[name="' + name + '"]');
-                                    if (input) {
-                                        try {
-                                            const setter = Object.getOwnPropertyDescriptor(
-                                                HTMLInputElement.prototype, 'value').set;
-                                            setter.call(input, token);
-                                            input.dispatchEvent(new Event('input', {bubbles: true}));
-                                            input.dispatchEvent(new Event('change', {bubbles: true}));
-                                            results.push('input_set:' + name);
-                                        } catch(e) { results.push('input_err:' + name); }
-                                    }
-                                }
-
-                                // Override turnstile.getResponse
-                                try {
-                                    if (window.turnstile) {
-                                        window.turnstile.getResponse = () => token;
-                                        results.push('getResponse_overridden');
-                                    }
-                                } catch(e) {}
-
-                                return results;
                             }
-                        """, token)
-                        logger.info("LView injection results: %s", inject_result)
-                    else:
-                        logger.info("Button enabled after callback — skipping LView search")
+
+                            // === STRATEGY 4: DOM events on formcontrolname elements ===
+                            // Angular's ValueAccessor listens for 'input' events.
+                            // If captcha controls have DOM elements, set values via events.
+                            if (!loginFormGroup) {
+                                results.push('S4_dom_events');
+                                const captchaInput = document.querySelector(
+                                    '[formcontrolname*="captcha"], [formcontrolname*="token"]');
+                                if (captchaInput) {
+                                    results.push('S4_found:' + captchaInput.getAttribute('formcontrolname'));
+                                    const setter = Object.getOwnPropertyDescriptor(
+                                        HTMLInputElement.prototype, 'value').set;
+                                    setter.call(captchaInput, token);
+                                    captchaInput.dispatchEvent(new Event('input', {bubbles: true}));
+                                    captchaInput.dispatchEvent(new Event('change', {bubbles: true}));
+                                    captchaInput.dispatchEvent(new Event('blur', {bubbles: true}));
+                                    results.push('S4_value_set');
+                                } else {
+                                    results.push('S4_no_captcha_input');
+                                }
+                            }
+
+                            // === FALLBACK: Set hidden inputs ===
+                            const hiddenNames = ['cf-turnstile-response', 'g-recaptcha-response'];
+                            for (const name of hiddenNames) {
+                                const input = document.querySelector('[name="' + name + '"]');
+                                if (input) {
+                                    try {
+                                        const setter = Object.getOwnPropertyDescriptor(
+                                            HTMLInputElement.prototype, 'value').set;
+                                        setter.call(input, token);
+                                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                                        results.push('hidden_set:' + name);
+                                    } catch(e) {}
+                                }
+                            }
+
+                            // Override turnstile.getResponse
+                            try {
+                                if (window.turnstile) {
+                                    window.turnstile.getResponse = () => token;
+                                    results.push('getResponse_overridden');
+                                }
+                            } catch(e) {}
+
+                            return results;
+                        }
+                    """, token)
+                    logger.info("Injection results: %s", inject_result)
                     await page.wait_for_timeout(3000)
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
@@ -1161,16 +1262,18 @@ async def _do_login() -> dict:
             logger.info("Route interceptor set up for login API")
 
             # Click Sign In button
+            # NOTE: VFS button does NOT have type="submit" — use text match first
             logger.info("Looking for Sign In button...")
-            sign_in = page.locator('button[type="submit"]:has-text("Sign In")')
+            sign_in = page.locator('button:has-text("Sign In")')
             try:
-                await sign_in.wait_for(state="attached", timeout=60000)
-                logger.info("Sign In button found in DOM")
+                await sign_in.wait_for(state="attached", timeout=10000)
+                logger.info("Sign In button found")
             except Exception:
-                sign_in = page.locator('button:has-text("Sign In")')
+                # Fallback to type="submit"
+                sign_in = page.locator('button[type="submit"]')
                 try:
-                    await sign_in.wait_for(state="attached", timeout=30000)
-                    logger.info("Sign In button found (broad selector)")
+                    await sign_in.wait_for(state="attached", timeout=10000)
+                    logger.info("Sign In button found via type=submit")
                 except Exception:
                     logger.error("Sign In button not found on page")
                     await _log_page_debug(page, "submit-not-found")
@@ -1190,15 +1293,23 @@ async def _do_login() -> dict:
                     logger.warning("Force-enabling Sign In button + form submission")
                     await page.evaluate("""
                         () => {
-                            // Force-enable the button
-                            const btn = document.querySelector('button[type="submit"]');
-                            if (btn) {
-                                btn.disabled = false;
-                                btn.classList.remove('mat-mdc-button-disabled');
-                                btn.removeAttribute('disabled');
+                            // Force-enable ALL buttons containing "Sign In"
+                            const allBtns = document.querySelectorAll('button');
+                            for (const btn of allBtns) {
+                                if ((btn.textContent || '').includes('Sign In')) {
+                                    btn.disabled = false;
+                                    btn.classList.remove('mat-mdc-button-disabled');
+                                    btn.removeAttribute('disabled');
+                                }
                             }
-                            // Also try to make Angular's form "valid" by removing validators
-                            // Find all form controls and clear validators
+                            // Also try type=submit as fallback
+                            const submitBtn = document.querySelector('button[type="submit"]');
+                            if (submitBtn) {
+                                submitBtn.disabled = false;
+                                submitBtn.classList.remove('mat-mdc-button-disabled');
+                                submitBtn.removeAttribute('disabled');
+                            }
+                            // Set forms to noValidate
                             const forms = document.querySelectorAll('form');
                             for (const f of forms) {
                                 f.noValidate = true;
@@ -1313,13 +1424,54 @@ async def _do_login() -> dict:
                             if (formFound) break;
                         }
 
-                        // Force-enable button
-                        const btn = document.querySelector('button[type="submit"]');
-                        if (btn) {
-                            btn.disabled = false;
-                            btn.classList.remove('mat-mdc-button-disabled');
-                            btn.removeAttribute('disabled');
-                            results.push('button_force_enabled');
+                        // Force-enable Sign In button (by text, not type)
+                        const allBtns = document.querySelectorAll('button');
+                        for (const btn of allBtns) {
+                            if ((btn.textContent || '').includes('Sign In')) {
+                                btn.disabled = false;
+                                btn.classList.remove('mat-mdc-button-disabled');
+                                btn.removeAttribute('disabled');
+                                results.push('button_force_enabled');
+                            }
+                        }
+
+                        // Also try ng.getComponent + form patching in deep retry
+                        if (typeof ng !== 'undefined' && typeof ng.getComponent === 'function') {
+                            const formEls = document.querySelectorAll(
+                                '[formcontrolname], form, app-login');
+                            for (const el of formEls) {
+                                let current = el;
+                                while (current) {
+                                    try {
+                                        const comp = ng.getComponent(current);
+                                        if (comp) {
+                                            const props = Object.getOwnPropertyNames(comp);
+                                            for (const p of props) {
+                                                try {
+                                                    const fg = comp[p];
+                                                    if (fg && typeof fg === 'object' && fg.controls) {
+                                                        const keys = Object.keys(fg.controls);
+                                                        if (keys.includes('username') || keys.includes('password')) {
+                                                            results.push('DEEP_NG_FOUND:' + keys.join(','));
+                                                            for (const cn of keys) {
+                                                                const ctrl = fg.controls[cn];
+                                                                if (ctrl.clearValidators) ctrl.clearValidators();
+                                                                ctrl.setErrors(null);
+                                                                if (cn.toLowerCase().includes('captcha'))
+                                                                    ctrl.setValue(token);
+                                                                ctrl.updateValueAndValidity();
+                                                            }
+                                                            fg.updateValueAndValidity();
+                                                            results.push('DEEP_NG_valid:' + fg.valid);
+                                                        }
+                                                    }
+                                                } catch(e) {}
+                                            }
+                                        }
+                                    } catch(e) {}
+                                    current = current.parentElement;
+                                }
+                            }
                         }
 
                         return results;
