@@ -913,38 +913,80 @@ async def _do_login() -> dict:
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
-                    # Store token in page for fake Turnstile to use
-                    # If fake turnstile.render() already fired (callback stored),
-                    # this will trigger the polling interval to invoke it.
-                    await page.evaluate(
-                        "(t) => { window.__captchaToken = t; console.log('TOKEN_SET len=' + t.length); }",
-                        token,
-                    )
-                    logger.info("Token stored in window.__captchaToken")
+                    # ── Install fake window.turnstile on the MAIN PAGE ──
+                    # The real api.js loaded in the Cloudflare IFRAME, not the main
+                    # page, so window.turnstile is undefined here. We set it directly
+                    # with a getter/setter trap so the real api.js can't overwrite it.
+                    # When Angular calls turnstile.render() after Sign In click,
+                    # our fake immediately invokes the callback with the solved token.
+                    install_result = await page.evaluate("""
+                        (token) => {
+                            const results = [];
+                            window.__captchaToken = token;
+                            results.push('token_set');
 
-                    # Check if fake Turnstile already captured a callback
-                    cb_state = await page.evaluate("""
-                        () => ({
-                            callback: !!window.__turnstileCallback,
-                            all_cbs: (window.__allTurnstileCallbacks || []).length,
-                            ts_exists: typeof window.turnstile !== 'undefined' && window.turnstile !== null,
-                            sitekey: window.__capturedTurnstileSitekey || null,
-                        })
-                    """)
-                    logger.info("Post-solve state: %s", cb_state)
+                            // Build fake turnstile
+                            const fake = {
+                                render: function(container, options) {
+                                    console.log('FAKE_TS_RENDER container=' +
+                                        (typeof container === 'string' ? container : 'element'));
+                                    if (options) {
+                                        if (options.sitekey) {
+                                            window.__capturedTurnstileSitekey = options.sitekey;
+                                            console.log('FAKE_TS_SITEKEY:' + options.sitekey);
+                                        }
+                                        if (typeof options.callback === 'function') {
+                                            window.__turnstileCallback = options.callback;
+                                            window.__allTurnstileCallbacks.push(options.callback);
+                                            console.log('FAKE_TS_CB_STORED');
+                                            // Invoke immediately with our token
+                                            try {
+                                                options.callback(token);
+                                                console.log('FAKE_TS_CB_INVOKED');
+                                                results.push('cb_invoked');
+                                            } catch(e) {
+                                                console.log('FAKE_TS_CB_ERR:' + e.message);
+                                                results.push('cb_err:' + e.message);
+                                            }
+                                        }
+                                    }
+                                    return 'fake_widget_0';
+                                },
+                                execute: function(c, o) {
+                                    console.log('FAKE_TS_EXECUTE');
+                                    if (o && typeof o.callback === 'function') o.callback(token);
+                                    return token;
+                                },
+                                getResponse: function() { return token; },
+                                reset: function() {},
+                                remove: function() {},
+                                isExpired: function() { return false; },
+                                ready: function(cb) { if (typeof cb === 'function') cb(); }
+                            };
 
-                    # If callback was stored but token wasn't available yet, invoke now
-                    if cb_state.get("callback") and token:
-                        logger.info("Callback already stored — invoking with token")
-                        await page.evaluate("""
-                            (token) => {
-                                if (window.__turnstileCallback) {
-                                    try { window.__turnstileCallback(token); console.log('TOKEN_CB_INVOKED'); }
-                                    catch(e) { console.log('TOKEN_CB_ERR:' + e.message); }
-                                }
+                            // Install with getter/setter trap so real api.js can't overwrite
+                            try {
+                                Object.defineProperty(window, 'turnstile', {
+                                    get: function() { return fake; },
+                                    set: function(v) {
+                                        // Silently ignore — real api.js thinks it set it
+                                        console.log('FAKE_TS_BLOCKED_OVERWRITE type=' + typeof v);
+                                    },
+                                    configurable: false,
+                                    enumerable: true
+                                });
+                                results.push('installed_frozen');
+                            } catch(e) {
+                                // Property might already exist — try direct set
+                                window.turnstile = fake;
+                                results.push('installed_direct');
                             }
-                        """, token)
-                        await page.wait_for_timeout(2000)
+
+                            results.push('ts_type=' + typeof window.turnstile);
+                            return results;
+                        }
+                    """, token)
+                    logger.info("Fake turnstile installed: %s", install_result)
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
             else:
@@ -954,15 +996,14 @@ async def _do_login() -> dict:
             solved_captcha_token = token if sitekey else ""
             captcha_version = "Turnstile"
 
-            # Brief wait: if fake Turnstile already captured a callback,
-            # the polling interval should invoke it within ~1s
+            # Verify fake turnstile is installed
             if token:
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(1000)
                 btn_state = await page.evaluate("""
                     () => ({
-                        callback: !!window.__turnstileCallback,
-                        token_set: !!window.__captchaToken,
                         ts_exists: typeof window.turnstile !== 'undefined',
+                        ts_has_render: typeof window.turnstile?.render === 'function',
+                        token_set: !!window.__captchaToken,
                         btn_disabled: (() => {
                             const btns = document.querySelectorAll('button');
                             for (const b of btns) {
