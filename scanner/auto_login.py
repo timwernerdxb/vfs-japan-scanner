@@ -587,17 +587,23 @@ async def _do_login() -> dict:
                 await _log_page_debug(page, "email-not-found")
                 raise RuntimeError("Could not find email input field")
 
+            # Small pause after email fill — some forms reveal password after email
+            await page.wait_for_timeout(2000)
+
             # Fill password
             password_selectors = [
                 "#mat-input-1",
                 'input[type="password"]',
                 'input[name="password"]',
+                'input[placeholder*="assword"]',
                 'input[id*="password"]',
+                'input[formcontrolname="password"]',
             ]
             password_filled = False
             for sel in password_selectors:
                 try:
                     locator = page.locator(sel)
+                    await locator.wait_for(timeout=5000)
                     await locator.fill(VFS_PASSWORD)
                     password_filled = True
                     logger.info("Password filled using selector: %s", sel)
@@ -606,6 +612,19 @@ async def _do_login() -> dict:
                     continue
 
             if not password_filled:
+                # Debug: log what inputs are on the page
+                input_info = await page.evaluate("""
+                    () => {
+                        const inputs = document.querySelectorAll('input, mat-form-field');
+                        return Array.from(inputs).map(i => ({
+                            tag: i.tagName, id: i.id, name: i.name,
+                            type: i.type, placeholder: i.placeholder,
+                            class: i.className, visible: i.offsetParent !== null
+                        }));
+                    }
+                """)
+                logger.error("Password not found! All inputs on page: %s", input_info)
+                await _log_page_debug(page, "password-not-found")
                 raise RuntimeError("Could not find password input field")
 
             # Click sign in — VFS uses role=button "Sign In"
