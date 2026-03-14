@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
 
-from scanner.captcha_solver import solve_turnstile
+from scanner.captcha_solver import solve_turnstile, solve_recaptcha_v3
 
 VFS_LOGIN_URL = "https://visa.vfsglobal.com/are/en/prt/login"
 
@@ -374,169 +374,181 @@ async def _do_login() -> dict:
         page = await context.new_page()
 
         # Comprehensive anti-detection stealth patches
+        # Init script: stealth patches + CAPTCHA interception
+        # CRITICAL: Each section wrapped in try/catch — a single throw
+        # (e.g. non-configurable navigator.connection) kills the entire script.
         await context.add_init_script("""
         () => {
-            // Overwrite navigator.webdriver
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            // Chrome runtime
-            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
-            // Permissions
-            const origQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (params) =>
-                params.name === 'notifications'
-                    ? Promise.resolve({state: Notification.permission})
-                    : origQuery(params);
-            // Plugins (non-empty array)
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
-            });
-            // Languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en'],
-            });
-            // Connection
-            Object.defineProperty(navigator, 'connection', {
-                get: () => ({rtt: 50, downlink: 10, effectiveType: '4g', saveData: false}),
-            });
-            // Hardware concurrency
-            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-            // Device memory
-            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-            // Platform
-            Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
+            // ── STEALTH PATCHES (each wrapped to prevent cascade failure) ──
+            try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e) {}
+            try { window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}}; } catch(e) {}
+            try {
+                const oq = window.navigator.permissions.query;
+                window.navigator.permissions.query = (p) =>
+                    p.name === 'notifications'
+                        ? Promise.resolve({state: Notification.permission})
+                        : oq(p);
+            } catch(e) {}
+            try { Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]}); } catch(e) {}
+            try { Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']}); } catch(e) {}
+            try { Object.defineProperty(navigator, 'connection', {get: () => ({rtt:50,downlink:10,effectiveType:'4g',saveData:false})}); } catch(e) {}
+            try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8}); } catch(e) {}
+            try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch(e) {}
+            try { Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'}); } catch(e) {}
+            console.log('INIT_STEALTH_DONE');
 
-            // TURNSTILE CALLBACK CAPTURE via getter/setter trap.
-            // OLD APPROACH (broken): Immutable fake turnstile prevented CF api.js
-            // from initializing → onload callback never fired → Angular never called
-            // render() → callback never captured.
-            // NEW APPROACH: Let CF api.js set window.turnstile normally via our
-            // setter, then wrap render() to capture Angular's callback.
-            window.__capturedTurnstileSitekey = null;
-            window.__turnstileCallback = null;
-            window.__turnstileWidgetId = null;
-            window.__allTurnstileCallbacks = [];
+            // ── TURNSTILE CALLBACK CAPTURE (getter/setter trap) ──
+            try {
+                window.__capturedTurnstileSitekey = null;
+                window.__turnstileCallback = null;
+                window.__turnstileWidgetId = null;
+                window.__allTurnstileCallbacks = [];
 
-            function _wrapTurnstileObj(ts) {
-                if (!ts || typeof ts !== 'object' || ts.__wrapped) return ts;
-
-                // Wrap render()
-                if (typeof ts.render === 'function') {
-                    const origRender = ts.render.bind(ts);
-                    ts.render = function(container, options) {
-                        console.log('TURNSTILE_RENDER_INTERCEPTED container=' +
-                                    (typeof container === 'string' ? container : container?.id || 'element'));
-                        if (options) {
-                            console.log('TURNSTILE_RENDER_OPTIONS: ' + Object.keys(options).join(','));
-                            if (options.sitekey) {
-                                window.__capturedTurnstileSitekey = options.sitekey;
-                                console.log('TURNSTILE_SITEKEY_CAPTURED:' + options.sitekey);
+                function _wrapTs(ts) {
+                    if (!ts || typeof ts !== 'object' || ts.__wrapped) return ts;
+                    if (typeof ts.render === 'function') {
+                        const orig = ts.render.bind(ts);
+                        ts.render = function(c, o) {
+                            console.log('TURNSTILE_RENDER_INTERCEPTED');
+                            if (o) {
+                                if (o.sitekey) { window.__capturedTurnstileSitekey = o.sitekey; console.log('TURNSTILE_SITEKEY:'+o.sitekey); }
+                                if (o.callback) { window.__turnstileCallback = o.callback; window.__allTurnstileCallbacks.push(o.callback); console.log('TURNSTILE_CB_CAPTURED'); }
+                                if (o['error-callback']) o['error-callback'] = function(){};
+                                if (o['expired-callback']) o['expired-callback'] = function(){};
                             }
-                            if (options.callback) {
-                                window.__turnstileCallback = options.callback;
-                                window.__allTurnstileCallbacks.push(options.callback);
-                                console.log('TURNSTILE_CALLBACK_CAPTURED type=' + typeof options.callback);
-                            }
-                            // Suppress error/expired callbacks to prevent form invalidation
-                            if (options['error-callback']) {
-                                console.log('TURNSTILE_HAS_ERROR_CB (suppressing)');
-                                options['error-callback'] = function() {
-                                    console.log('TURNSTILE_ERROR_SUPPRESSED');
-                                };
-                            }
-                            if (options['expired-callback']) {
-                                console.log('TURNSTILE_HAS_EXPIRED_CB (suppressing)');
-                                options['expired-callback'] = function() {
-                                    console.log('TURNSTILE_EXPIRED_SUPPRESSED');
-                                };
-                            }
-                        }
-                        try {
-                            const widgetId = origRender(container, options);
-                            console.log('TURNSTILE_RENDER_OK widgetId=' + widgetId);
-                            window.__turnstileWidgetId = widgetId;
-                            return widgetId;
-                        } catch(e) {
-                            console.log('TURNSTILE_RENDER_ERROR: ' + e.message);
-                            window.__turnstileWidgetId = 'fallback-widget-0';
-                            return 'fallback-widget-0';
-                        }
-                    };
+                            try { var r = orig(c, o); window.__turnstileWidgetId = r; return r; }
+                            catch(e) { return 'fw0'; }
+                        };
+                    }
+                    if (typeof ts.execute === 'function') {
+                        const origE = ts.execute.bind(ts);
+                        ts.execute = function(c, o) {
+                            console.log('TURNSTILE_EXECUTE_INTERCEPTED');
+                            if (o && o.callback) { window.__turnstileCallback = o.callback; console.log('TURNSTILE_CB_VIA_EXEC'); }
+                            try { return origE(c, o); } catch(e) { return 'fw0'; }
+                        };
+                    }
+                    ts.__wrapped = true;
+                    console.log('TURNSTILE_WRAPPED');
+                    return ts;
                 }
 
-                // Wrap execute()
-                if (typeof ts.execute === 'function') {
-                    const origExec = ts.execute.bind(ts);
-                    ts.execute = function(container, options) {
-                        console.log('TURNSTILE_EXECUTE_INTERCEPTED');
-                        if (options && options.callback) {
-                            window.__turnstileCallback = options.callback;
-                            window.__allTurnstileCallbacks.push(options.callback);
-                            console.log('TURNSTILE_CALLBACK_CAPTURED via execute');
-                        }
-                        try { return origExec(container, options); }
-                        catch(e) { return 'fallback-widget-0'; }
-                    };
+                let _realTs = null;
+                Object.defineProperty(window, 'turnstile', {
+                    get() { return _realTs; },
+                    set(v) { console.log('TURNSTILE_SET type='+typeof v); _realTs = v; if (v && typeof v==='object') _wrapTs(v); },
+                    configurable: true, enumerable: true
+                });
+                // Polling fallback
+                const _tp = setInterval(() => { try { var t=window.turnstile; if(t&&typeof t==='object'&&!t.__wrapped){_wrapTs(t);console.log('TURNSTILE_POLL_WRAP');} }catch(e){} }, 500);
+                setTimeout(() => clearInterval(_tp), 60000);
+                console.log('INIT_TURNSTILE_TRAP_OK');
+            } catch(e) { console.log('INIT_TURNSTILE_TRAP_FAIL:'+e.message); }
+
+            // ── RECAPTCHA INTERCEPTION (getter/setter + execute override) ──
+            // VFS uses reCAPTCHA v3 for login (via volt-recaptcha script).
+            // We intercept grecaptcha.execute() to return our pre-solved token.
+            try {
+                window.__recaptchaSitekey = null;
+                window.__recaptchaToken = null;  // Set from Python after CapSolver
+                window.__recaptchaResolvers = [];
+                window.__recaptchaCallback = null;
+
+                function _wrapGc(gc) {
+                    if (!gc || typeof gc !== 'object' || gc.__wrapped) return gc;
+
+                    // Wrap execute() — reCAPTCHA v3 main method
+                    if (typeof gc.execute === 'function') {
+                        const origExec = gc.execute.bind(gc);
+                        gc.execute = function(sitekey, options) {
+                            console.log('RECAPTCHA_EXECUTE sk='+sitekey+' action='+(options?.action||''));
+                            window.__recaptchaSitekey = sitekey;
+
+                            // If we already have a pre-solved token, return immediately
+                            if (window.__recaptchaToken) {
+                                console.log('RECAPTCHA_RETURNING_PRESOLVED');
+                                return Promise.resolve(window.__recaptchaToken);
+                            }
+
+                            // Otherwise wait for Python to set the token
+                            console.log('RECAPTCHA_WAITING_FOR_TOKEN');
+                            return new Promise(function(resolve) {
+                                window.__recaptchaResolvers.push(resolve);
+                                var cid = setInterval(function() {
+                                    if (window.__recaptchaToken) {
+                                        clearInterval(cid);
+                                        resolve(window.__recaptchaToken);
+                                    }
+                                }, 500);
+                                // Timeout: fall back to real execute after 90s
+                                setTimeout(function() {
+                                    clearInterval(cid);
+                                    console.log('RECAPTCHA_TIMEOUT_FALLBACK');
+                                    origExec(sitekey, options).then(resolve);
+                                }, 90000);
+                            });
+                        };
+                    }
+
+                    // Wrap render() — reCAPTCHA v2 (if used)
+                    if (typeof gc.render === 'function') {
+                        const origR = gc.render.bind(gc);
+                        gc.render = function(c, o) {
+                            console.log('RECAPTCHA_RENDER');
+                            if (o && o.sitekey) { window.__recaptchaSitekey = o.sitekey; console.log('RECAPTCHA_SITEKEY:'+o.sitekey); }
+                            if (o && o.callback) { window.__recaptchaCallback = o.callback; console.log('RECAPTCHA_CB_CAPTURED'); }
+                            return origR(c, o);
+                        };
+                    }
+
+                    gc.__wrapped = true;
+                    console.log('RECAPTCHA_WRAPPED');
+                    return gc;
                 }
 
-                ts.__wrapped = true;
-                console.log('TURNSTILE_OBJECT_WRAPPED');
-                return ts;
-            }
+                let _realGc = null;
+                Object.defineProperty(window, 'grecaptcha', {
+                    get() { return _realGc; },
+                    set(v) { console.log('RECAPTCHA_SET type='+typeof v); _realGc = v; if (v && typeof v==='object') _wrapGc(v); },
+                    configurable: true, enumerable: true
+                });
+                // Polling fallback for grecaptcha
+                const _gp = setInterval(() => { try { var g=window.grecaptcha; if(g&&typeof g==='object'&&!g.__wrapped){_wrapGc(g);console.log('RECAPTCHA_POLL_WRAP');} }catch(e){} }, 500);
+                setTimeout(() => clearInterval(_gp), 60000);
+                console.log('INIT_RECAPTCHA_TRAP_OK');
+            } catch(e) { console.log('INIT_RECAPTCHA_TRAP_FAIL:'+e.message); }
 
-            // Getter/setter trap: intercept when CF api.js sets window.turnstile
-            let _realTurnstile = null;
-            Object.defineProperty(window, 'turnstile', {
-                get() { return _realTurnstile; },
-                set(val) {
-                    console.log('TURNSTILE_PROPERTY_SET type=' + typeof val);
-                    _realTurnstile = val;
-                    if (val && typeof val === 'object') {
-                        _wrapTurnstileObj(val);
-                    }
-                },
-                configurable: true,  // Allow CF to redefine if absolutely needed
-                enumerable: true
-            });
-            console.log('TURNSTILE_GETTER_SETTER installed');
-
-            // Polling fallback: if CF replaces our getter/setter, re-wrap
-            const _tsPollId = setInterval(() => {
-                try {
-                    const ts = window.turnstile;
-                    if (ts && typeof ts === 'object' && !ts.__wrapped) {
-                        _wrapTurnstileObj(ts);
-                        console.log('TURNSTILE_WRAPPED via polling');
-                    }
-                } catch(e) {}
-            }, 300);
-            setTimeout(() => clearInterval(_tsPollId), 60000);
-
-            // Watch for Turnstile/reCAPTCHA script tags being added
-            const observer = new MutationObserver((mutations) => {
-                for (const m of mutations) {
-                    for (const node of m.addedNodes) {
-                        if (node.tagName === 'SCRIPT' && node.src) {
-                            if (node.src.includes('challenges.cloudflare.com')) {
-                                console.log('TURNSTILE_SCRIPT_ADDED: ' + node.src);
-                                // Check for onload param in URL
-                                const olMatch = node.src.match(/[?&]onload=([^&]+)/);
-                                if (olMatch) {
-                                    console.log('TURNSTILE_ONLOAD_PARAM: ' + olMatch[1]);
+            // ── SCRIPT TAG OBSERVER ──
+            try {
+                const obs = new MutationObserver((mutations) => {
+                    for (const m of mutations) {
+                        for (const node of m.addedNodes) {
+                            if (node.tagName === 'SCRIPT' && node.src) {
+                                if (node.src.includes('challenges.cloudflare.com'))
+                                    console.log('TURNSTILE_SCRIPT:'+node.src.substring(0,100));
+                                if (node.src.includes('recaptcha') || node.src.includes('gstatic.com'))
+                                    console.log('RECAPTCHA_SCRIPT:'+node.src.substring(0,100));
+                                // Capture reCAPTCHA sitekey from URL render= param
+                                if (node.src.includes('recaptcha')) {
+                                    var rm = node.src.match(/[?&]render=([^&]+)/);
+                                    if (rm && rm[1] !== 'explicit') {
+                                        window.__recaptchaSitekey = rm[1];
+                                        console.log('RECAPTCHA_SITEKEY_FROM_URL:'+rm[1]);
+                                    }
                                 }
                             }
-                            if (node.src.includes('recaptcha') || node.src.includes('gstatic.com')) {
-                                console.log('RECAPTCHA_SCRIPT_ADDED: ' + node.src);
-                            }
                         }
                     }
-                }
-            });
-            observer.observe(document.documentElement, {childList: true, subtree: true});
+                });
+                obs.observe(document.documentElement, {childList: true, subtree: true});
+                console.log('INIT_OBSERVER_OK');
+            } catch(e) { console.log('INIT_OBSERVER_FAIL:'+e.message); }
         }
         """)
 
-        # Intercept requests to capture auth headers and Turnstile sitekey
+        # Intercept requests to capture auth headers and CAPTCHA sitekeys
         captured_turnstile_sitekey = {}
+        captured_recaptcha_sitekey = {}
 
         async def on_request(request):
             url = request.url
@@ -588,16 +600,34 @@ async def _do_login() -> dict:
             if msg.type in ("error", "warning"):
                 logger.info("[console.%s] %s", msg.type, text)
                 js_errors.append(text)
-            # Log ALL our turnstile interception messages
+            # Log init script section confirmations
+            if text.startswith("INIT_"):
+                logger.info("[console] %s", text)
+            # Log ALL our CAPTCHA interception messages
             if text.startswith("TURNSTILE_") or text.startswith("RECAPTCHA_"):
                 logger.info("[console] %s", text)
-            # Capture sitekey from our hook
+            # Capture Turnstile sitekey from our hook
             if "TURNSTILE_SITEKEY_CAPTURED:" in text:
                 key = text.split("TURNSTILE_SITEKEY_CAPTURED:")[1].strip()
                 captured_turnstile_sitekey["key"] = key
                 logger.info("Captured Turnstile sitekey from console hook: %s...", key[:12])
             if "TURNSTILE_RENDER_WRAPPED" in text:
                 logger.info("Turnstile render() successfully wrapped")
+            # Capture reCAPTCHA sitekey from execute() intercept
+            if "RECAPTCHA_EXECUTE" in text:
+                # Format: RECAPTCHA_EXECUTE sk=6L... action=login
+                for part in text.split():
+                    if part.startswith("sk="):
+                        captured_recaptcha_sitekey["key"] = part[3:]
+                        logger.info("Captured reCAPTCHA sitekey from execute: %s", part[3:])
+            if "RECAPTCHA_SITEKEY_FROM_URL:" in text:
+                key = text.split("RECAPTCHA_SITEKEY_FROM_URL:")[1].strip()
+                captured_recaptcha_sitekey["key"] = key
+                logger.info("Captured reCAPTCHA sitekey from URL: %s", key)
+            if "RECAPTCHA_SITEKEY:" in text and "FROM_URL" not in text:
+                key = text.split("RECAPTCHA_SITEKEY:")[1].strip()
+                captured_recaptcha_sitekey["key"] = key
+                logger.info("Captured reCAPTCHA sitekey: %s", key)
 
         page.on("console", on_console)
 
@@ -1197,12 +1227,107 @@ async def _do_login() -> dict:
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
             else:
-                logger.warning("No Turnstile sitekey found — button may stay disabled")
+                logger.warning("No Turnstile sitekey found — proceeding to reCAPTCHA check")
+
+            # ── RECAPTCHA V3 DETECTION AND SOLVING ──
+            # VFS uses reCAPTCHA v3 for login form (via volt-recaptcha script).
+            # Our init script intercepts grecaptcha.execute() — when Angular calls it,
+            # the override captures the sitekey and waits for __recaptchaToken.
+            # We detect the sitekey here, solve via CapSolver, and set the token.
+            recaptcha_token = ""
+            logger.info("Checking for reCAPTCHA v3 (waiting up to 45s)...")
+
+            for rc_wait in range(23):  # 23 × 2s = 46s
+                rc_state = await page.evaluate("""
+                    () => {
+                        const state = {};
+                        state.sitekey = window.__recaptchaSitekey || null;
+                        state.execute_waiting = (window.__recaptchaResolvers || []).length > 0;
+                        state.recaptcha_loaded = !!(window.grecaptcha && typeof window.grecaptcha === 'object');
+                        state.recaptcha_wrapped = !!(window.grecaptcha && window.grecaptcha.__wrapped);
+                        state.token_set = !!window.__recaptchaToken;
+
+                        // Check volt-recaptcha script for sitekey
+                        const voltScript = document.querySelector('#volt-recaptcha, script[id*="recaptcha"]');
+                        if (voltScript) {
+                            state.volt_id = voltScript.id || '';
+                            state.volt_src = (voltScript.src || '').substring(0, 200);
+                            state.volt_content = (voltScript.textContent || '').substring(0, 300);
+                            // Extract sitekey from src render= param
+                            if (voltScript.src) {
+                                const m = voltScript.src.match(/[?&]render=([^&]+)/);
+                                if (m && m[1] !== 'explicit' && !state.sitekey) state.sitekey = m[1];
+                            }
+                            // Extract sitekey from inline content
+                            if (voltScript.textContent) {
+                                const m = voltScript.textContent.match(/['"]?(6L[a-zA-Z0-9_-]{30,})['"]?/);
+                                if (m && !state.sitekey) state.sitekey = m[1];
+                            }
+                        }
+
+                        // Check any loaded recaptcha scripts
+                        const rcScripts = document.querySelectorAll(
+                            'script[src*="recaptcha"], script[src*="gstatic.com/recaptcha"]');
+                        state.rc_scripts = [];
+                        for (const s of rcScripts) {
+                            state.rc_scripts.push(s.src.substring(0, 120));
+                            const m = s.src.match(/[?&]render=([^&]+)/);
+                            if (m && m[1] !== 'explicit' && !state.sitekey) state.sitekey = m[1];
+                        }
+
+                        return state;
+                    }
+                """)
+
+                if (rc_wait + 1) % 5 == 0 or rc_state.get("sitekey"):
+                    logger.info("reCAPTCHA state (%d/23): %s", rc_wait + 1, rc_state)
+
+                # Also check Python-side captured sitekey from console
+                if not rc_state.get("sitekey") and captured_recaptcha_sitekey.get("key"):
+                    rc_state["sitekey"] = captured_recaptcha_sitekey["key"]
+                    logger.info("Using reCAPTCHA sitekey from console capture: %s", rc_state["sitekey"])
+
+                sk = rc_state.get("sitekey")
+                if sk:
+                    # Sitekey found — solve it
+                    label = "on-demand (execute waiting)" if rc_state.get("execute_waiting") else "pre-solve"
+                    logger.info("reCAPTCHA sitekey found (%s): %s — solving via CapSolver...", label, sk)
+                    try:
+                        recaptcha_token = solve_recaptcha_v3(
+                            VFS_LOGIN_URL, sk, page_action="login"
+                        )
+                        logger.info("reCAPTCHA v3 solved! Token length: %d", len(recaptcha_token))
+                        await page.evaluate(
+                            "(t) => { window.__recaptchaToken = t; }",
+                            recaptcha_token,
+                        )
+                        logger.info("Set window.__recaptchaToken — execute() override will return it")
+                        # Give Angular time to process the token
+                        await page.wait_for_timeout(3000)
+                        break
+                    except Exception as e:
+                        logger.warning("reCAPTCHA v3 solve failed: %s", e)
+                        break
+
+                await page.wait_for_timeout(2000)
+
+            if not recaptcha_token:
+                logger.info("No reCAPTCHA sitekey detected — will retry on-demand after click")
+
+            # Determine best captcha token for route interceptor
+            if recaptcha_token:
+                solved_captcha_token = recaptcha_token
+                captcha_version = "v3"
+            elif token:
+                solved_captcha_token = token
+                captcha_version = "Turnstile"
+            else:
+                solved_captcha_token = ""
+                captcha_version = "v3"  # Default: VFS login uses reCAPTCHA v3
 
             # ── ROUTE INTERCEPTOR: Inject captcha token into login API POST ──
             # Set up BEFORE form interaction so it's ready when Angular submits.
             # From bundle analysis: VFS expects captcha_api_key + captcha_version in body.
-            solved_captcha_token = token if sitekey else ""
 
             login_api_captured = {}
 
@@ -1244,9 +1369,9 @@ async def _do_login() -> dict:
                                 modified = True
                                 logger.info("[route] Added captcha_api_key to login body")
                             if "captcha_version" not in body:
-                                body["captcha_version"] = "Turnstile"
+                                body["captcha_version"] = captcha_version
                                 modified = True
-                                logger.info("[route] Added captcha_version to login body")
+                                logger.info("[route] Added captcha_version=%s to login body", captcha_version)
 
                         if modified:
                             logger.info("[route] Final body keys: %s", list(body.keys()))
@@ -1323,176 +1448,126 @@ async def _do_login() -> dict:
             await sign_in.click(force=True)
             logger.info("Clicked Sign In button")
 
-            # Wait for navigation or API response
-            logger.info("Waiting for post-login page...")
+            # ── POST-CLICK: Wait for navigation + on-demand reCAPTCHA solving ──
+            # After clicking Sign In, Angular may call grecaptcha.execute().
+            # Our init script override captures the sitekey and waits for __recaptchaToken.
+            # We poll for this, solve via CapSolver, and set the token to unblock Angular.
+            logger.info("Waiting for post-login navigation (+ monitoring reCAPTCHA)...")
             login_success = False
-            try:
-                await page.wait_for_url("**/dashboard", timeout=15000)
-                logger.info("Dashboard loaded — login successful!")
-                login_success = True
-            except Exception:
-                try:
-                    start_booking = page.get_by_role("button", name="Start New Booking")
-                    await start_booking.wait_for(timeout=5000)
-                    logger.info("Post-login page loaded (Start New Booking visible)")
+
+            for nav_wait in range(45):  # 45 × 2s = 90s max
+                current_url = page.url
+
+                # Check for successful navigation
+                if "dashboard" in current_url or "application-detail" in current_url:
+                    logger.info("Navigation detected — URL: %s", current_url)
                     login_success = True
+                    break
+
+                try:
+                    start_booking = page.locator('button:has-text("Start New Booking")')
+                    if await start_booking.count() > 0:
+                        logger.info("Post-login page loaded (Start New Booking visible)")
+                        login_success = True
+                        break
                 except Exception:
-                    current_url = page.url
-                    logger.warning("Form click did not navigate. URL: %s", current_url)
+                    pass
 
-            # FALLBACK: If form submission failed, try re-patching and resubmitting
-            if not login_success and solved_captcha_token:
-                logger.info("Form click didn't navigate — trying deeper Angular patching...")
+                # On-demand reCAPTCHA solving (if not already solved)
+                if not recaptcha_token:
+                    rc_state = await page.evaluate("""
+                        () => ({
+                            sitekey: window.__recaptchaSitekey || null,
+                            waiting: (window.__recaptchaResolvers || []).length > 0,
+                            token_set: !!window.__recaptchaToken,
+                        })
+                    """)
 
-                # Deep retry: try callback again + LView + nuclear form bypass
-                retry_result = await page.evaluate("""
+                    # Also check Python-captured sitekey
+                    sk = rc_state.get("sitekey") or captured_recaptcha_sitekey.get("key")
+
+                    if sk and (rc_state.get("waiting") or True) and not rc_state.get("token_set"):
+                        logger.info(
+                            "reCAPTCHA detected post-click! sitekey=%s waiting=%s — solving...",
+                            sk, rc_state.get("waiting"),
+                        )
+                        try:
+                            recaptcha_token = solve_recaptcha_v3(
+                                VFS_LOGIN_URL, sk, page_action="login"
+                            )
+                            logger.info("On-demand reCAPTCHA solved! Token length: %d", len(recaptcha_token))
+                            await page.evaluate(
+                                "(t) => { window.__recaptchaToken = t; }",
+                                recaptcha_token,
+                            )
+                            logger.info("Set __recaptchaToken — Angular should proceed")
+                            solved_captcha_token = recaptcha_token
+                            captcha_version = "v3"
+                            # Give Angular time to process and submit
+                            await page.wait_for_timeout(5000)
+                            continue
+                        except Exception as e:
+                            logger.warning("On-demand reCAPTCHA solve failed: %s", e)
+
+                # Log progress every 10s
+                if (nav_wait + 1) % 5 == 0:
+                    logger.info("Navigation wait %d/45 — URL: %s", nav_wait + 1, current_url)
+
+                await page.wait_for_timeout(2000)
+
+            # If still not navigated, try deep Angular patch + re-click
+            if not login_success:
+                logger.info("First click didn't navigate — trying force-enable + re-click...")
+
+                await page.evaluate("""
                     (token) => {
-                        const results = [];
-
-                        // Retry callback invocation
-                        if (window.__turnstileCallback) {
-                            try {
-                                window.__turnstileCallback(token);
-                                results.push('RETRY_CALLBACK_INVOKED');
-                            } catch(e) { results.push('retry_cb_err:' + e.message); }
-                        }
-
-                        // Deep LView search with recursive nesting
-                        const lViews = new Set();
-                        const allElements = document.querySelectorAll('*');
-                        for (const el of allElements) {
-                            const ctx = el.__ngContext__;
-                            if (Array.isArray(ctx) && ctx.length > 5) lViews.add(ctx);
-                        }
-                        function collectNested(arr, depth) {
-                            if (depth > 4) return;
-                            for (let i = 0; i < arr.length; i++) {
-                                const item = arr[i];
-                                if (Array.isArray(item) && item.length > 5 && !lViews.has(item)) {
-                                    lViews.add(item);
-                                    collectNested(item, depth + 1);
-                                }
-                            }
-                        }
-                        for (const lv of [...lViews]) collectNested(lv, 0);
-
-                        results.push('deep_lviews:' + lViews.size);
-                        let formFound = false;
-
-                        for (const lView of lViews) {
-                            for (let i = 0; i < Math.min(lView.length, 120); i++) {
-                                const item = lView[i];
-                                if (!item || typeof item !== 'object') continue;
-                                if (item instanceof Node || item instanceof Window) continue;
-                                if (Array.isArray(item)) continue;
-
-                                try {
-                                    const props = Object.getOwnPropertyNames(item).slice(0, 80);
-                                    for (const prop of props) {
-                                        try {
-                                            const val = item[prop];
-                                            if (!val || typeof val !== 'object') continue;
-                                            if (val instanceof Node || Array.isArray(val)) continue;
-                                            if (typeof val.controls !== 'object' || !val.controls) continue;
-
-                                            const cKeys = Object.keys(val.controls);
-                                            if (cKeys.includes('username') || cKeys.includes('password') ||
-                                                cKeys.includes('captcha_api_key')) {
-                                                results.push('DEEP_FOUND:' + cKeys.join(','));
-
-                                                // Set captcha fields + clear ALL validators
-                                                for (const cn of cKeys) {
-                                                    const ctrl = val.controls[cn];
-                                                    const lower = cn.toLowerCase();
-                                                    if (lower.includes('captcha') || lower.includes('token')) {
-                                                        ctrl.setValue(token);
-                                                    }
-                                                    if (ctrl.clearValidators) ctrl.clearValidators();
-                                                    ctrl.setErrors(null);
-                                                    ctrl.updateValueAndValidity();
-                                                }
-                                                val.updateValueAndValidity();
-                                                results.push('DEEP_form_valid:' + val.valid);
-                                                formFound = true;
-                                                break;
-                                            }
-                                        } catch(e) {}
-                                    }
-                                } catch(e) {}
-                                if (formFound) break;
-                            }
-                            if (formFound) break;
-                        }
-
-                        // Force-enable Sign In button (by text, not type)
+                        // Force-enable Sign In button
                         const allBtns = document.querySelectorAll('button');
                         for (const btn of allBtns) {
                             if ((btn.textContent || '').includes('Sign In')) {
                                 btn.disabled = false;
                                 btn.classList.remove('mat-mdc-button-disabled');
                                 btn.removeAttribute('disabled');
-                                results.push('button_force_enabled');
                             }
                         }
-
-                        // Also try ng.getComponent + form patching in deep retry
-                        if (typeof ng !== 'undefined' && typeof ng.getComponent === 'function') {
-                            const formEls = document.querySelectorAll(
-                                '[formcontrolname], form, app-login');
-                            for (const el of formEls) {
-                                let current = el;
-                                while (current) {
-                                    try {
-                                        const comp = ng.getComponent(current);
-                                        if (comp) {
-                                            const props = Object.getOwnPropertyNames(comp);
-                                            for (const p of props) {
-                                                try {
-                                                    const fg = comp[p];
-                                                    if (fg && typeof fg === 'object' && fg.controls) {
-                                                        const keys = Object.keys(fg.controls);
-                                                        if (keys.includes('username') || keys.includes('password')) {
-                                                            results.push('DEEP_NG_FOUND:' + keys.join(','));
-                                                            for (const cn of keys) {
-                                                                const ctrl = fg.controls[cn];
-                                                                if (ctrl.clearValidators) ctrl.clearValidators();
-                                                                ctrl.setErrors(null);
-                                                                if (cn.toLowerCase().includes('captcha'))
-                                                                    ctrl.setValue(token);
-                                                                ctrl.updateValueAndValidity();
-                                                            }
-                                                            fg.updateValueAndValidity();
-                                                            results.push('DEEP_NG_valid:' + fg.valid);
-                                                        }
-                                                    }
-                                                } catch(e) {}
-                                            }
-                                        }
-                                    } catch(e) {}
-                                    current = current.parentElement;
-                                }
-                            }
-                        }
-
-                        return results;
+                        // Set forms to noValidate
+                        const forms = document.querySelectorAll('form');
+                        for (const f of forms) f.noValidate = true;
                     }
                 """, solved_captcha_token)
-                logger.info("Deep Angular patch result: %s", retry_result)
 
-                # Click submit again
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(500)
                 try:
                     await sign_in.click(force=True)
                     logger.info("Re-clicked Sign In button")
 
-                    # Wait for navigation
-                    try:
-                        await page.wait_for_url("**/dashboard", timeout=15000)
-                        logger.info("Dashboard loaded after retry!")
-                        login_success = True
-                    except Exception:
-                        current_url = page.url
-                        logger.warning("Still no navigation after retry. URL: %s", current_url)
+                    # Wait for reCAPTCHA on-demand or navigation
+                    for retry_wait in range(20):  # 20 × 2s = 40s
+                        if "dashboard" in page.url or "application" in page.url:
+                            login_success = True
+                            logger.info("Dashboard loaded after retry!")
+                            break
+
+                        # On-demand reCAPTCHA (retry)
+                        if not recaptcha_token:
+                            sk = await page.evaluate("() => window.__recaptchaSitekey")
+                            sk = sk or captured_recaptcha_sitekey.get("key")
+                            if sk:
+                                try:
+                                    recaptcha_token = solve_recaptcha_v3(
+                                        VFS_LOGIN_URL, sk, page_action="login"
+                                    )
+                                    await page.evaluate(
+                                        "(t) => { window.__recaptchaToken = t; }",
+                                        recaptcha_token,
+                                    )
+                                    logger.info("Retry reCAPTCHA solved! Token length: %d", len(recaptcha_token))
+                                    await page.wait_for_timeout(5000)
+                                    continue
+                                except Exception as e:
+                                    logger.warning("Retry reCAPTCHA failed: %s", e)
+
+                        await page.wait_for_timeout(2000)
                 except Exception as e:
                     logger.warning("Re-click failed: %s", e)
 
