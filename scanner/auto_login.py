@@ -168,6 +168,9 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                 except Exception:
                     pass
 
+    # Only route these domains through the upstream proxy; everything else goes direct
+    PROXY_DOMAINS = ("vfsglobal.com",)
+
     def _handle(client):
         try:
             # Read initial request (e.g. CONNECT host:443 HTTP/1.1\r\n...\r\n\r\n)
@@ -180,23 +183,31 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                 buf += chunk
 
             first_line = buf.split(b"\r\n")[0].decode(errors="replace")
-            logger.info("[local-proxy] Received: %s", first_line)
 
-            # Connect to upstream proxy
-            upstream = socket.create_connection((upstream_host, upstream_port), timeout=15)
-            logger.info("[local-proxy] Connected to upstream %s:%d", upstream_host, upstream_port)
+            # Parse target from CONNECT request
+            # Format: CONNECT host:port HTTP/1.1
+            parts = first_line.split()
+            target = parts[1] if len(parts) > 1 else ""
+            target_host = target.split(":")[0]
+            target_port = int(target.split(":")[1]) if ":" in target else 443
 
-            # Inject Proxy-Authorization header before the blank line
-            idx = buf.index(b"\r\n\r\n")
-            patched = (
-                buf[:idx]
-                + f"\r\nProxy-Authorization: Basic {auth_b64}".encode()
-                + buf[idx:]
-            )
-            upstream.sendall(patched)
+            use_proxy = any(d in target_host for d in PROXY_DOMAINS)
 
-            if buf.startswith(b"CONNECT"):
-                # Read proxy response (e.g. HTTP/1.1 200 Connection established)
+            if use_proxy and buf.startswith(b"CONNECT"):
+                logger.info("[local-proxy] PROXY %s", target)
+                # Connect to upstream proxy
+                upstream = socket.create_connection((upstream_host, upstream_port), timeout=15)
+
+                # Inject Proxy-Authorization header
+                idx = buf.index(b"\r\n\r\n")
+                patched = (
+                    buf[:idx]
+                    + f"\r\nProxy-Authorization: Basic {auth_b64}".encode()
+                    + buf[idx:]
+                )
+                upstream.sendall(patched)
+
+                # Read proxy response
                 resp = b""
                 while b"\r\n\r\n" not in resp:
                     chunk = upstream.recv(4096)
@@ -204,7 +215,7 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                         break
                     resp += chunk
                 resp_line = resp.split(b"\r\n")[0].decode(errors="replace")
-                logger.info("[local-proxy] Upstream response: %s", resp_line)
+                logger.info("[local-proxy] Upstream: %s", resp_line)
                 client.sendall(resp)
 
                 if b" 200 " not in resp.split(b"\r\n")[0]:
@@ -212,6 +223,21 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                     client.close()
                     upstream.close()
                     return
+            elif buf.startswith(b"CONNECT"):
+                # Direct connection — bypass proxy
+                logger.info("[local-proxy] DIRECT %s", target)
+                upstream = socket.create_connection((target_host, target_port), timeout=15)
+                client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            else:
+                # Non-CONNECT request — forward through proxy
+                upstream = socket.create_connection((upstream_host, upstream_port), timeout=15)
+                idx = buf.index(b"\r\n\r\n")
+                patched = (
+                    buf[:idx]
+                    + f"\r\nProxy-Authorization: Basic {auth_b64}".encode()
+                    + buf[idx:]
+                )
+                upstream.sendall(patched)
 
             # Bidirectional relay
             t1 = threading.Thread(target=_relay, args=(client, upstream), daemon=True)
