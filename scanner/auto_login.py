@@ -36,6 +36,80 @@ PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
 logger = logging.getLogger("auto_login")
 
+# ── Known VFS API login endpoints (try in order) ──
+VFS_LOGIN_URLS = [
+    "https://lift-api.vfsglobal.com/master/login",
+    "https://lift-api.vfsglobal.com/account/login",
+    "https://lift-api.vfsglobal.com/login",
+]
+
+
+def _direct_api_login(captcha_token: str) -> dict | None:
+    """Try to login via direct Python HTTP POST (bypasses browser + proxy).
+
+    Returns parsed JSON response dict on success, or None on failure.
+    Tries multiple known login endpoint URLs.
+    """
+    import json as json_mod
+    import urllib.request
+    import urllib.error
+
+    login_body = json_mod.dumps({
+        "username": VFS_EMAIL,
+        "password": VFS_PASSWORD,
+        "captcha_api_key": captcha_token,
+        "captcha_version": "Turnstile",
+    }).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://visa.vfsglobal.com",
+        "Referer": "https://visa.vfsglobal.com/",
+        "Route": "are/en/prt",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        ),
+    }
+
+    for url in VFS_LOGIN_URLS:
+        try:
+            req = urllib.request.Request(url, data=login_body, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8")
+                logger.info("Direct login %s → %d: %s", url, resp.status, body[:500])
+                data = json_mod.loads(body)
+                # Check for JWT/token in response
+                for key in ("token", "Token", "jwt", "JWT", "authorize",
+                            "accessToken", "access_token"):
+                    if data.get(key):
+                        logger.info("Direct login SUCCESS via %s (key=%s)", url, key)
+                        return data
+                # Even if no known JWT key, return non-empty response
+                if data:
+                    logger.info("Direct login got response from %s (keys=%s)", url, list(data.keys()))
+                    return data
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            logger.info("Direct login %s → HTTP %d: %s", url, e.code, body)
+            if e.code == 404:
+                continue  # Wrong URL, try next
+            if 200 <= e.code < 300:
+                continue  # Shouldn't happen but just in case
+            # 401/403 might mean wrong credentials or expired captcha
+            # 400 might mean wrong body format
+            # Keep trying other URLs
+        except Exception as e:
+            logger.info("Direct login %s → error: %s", url, e)
+
+    logger.warning("Direct API login failed on all URLs")
+    return None
+
 
 async def _extract_turnstile_sitekey(page) -> str:
     """Extract the Cloudflare Turnstile sitekey from the page."""
@@ -173,9 +247,10 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
     # "Residential Failed (bad_endpoint)" for CAPTCHA challenge domains.
     # Cloudflare challenges go DIRECT from Railway — this works fine now
     # that the Object.defineProperty hook is removed.
+    # Only route the web frontend through Bright Data (for Cloudflare challenge).
+    # API calls go DIRECT — Bright Data blocks POST without KYC.
     PROXY_DOMAINS = (
         "visa.vfsglobal.com",
-        "lift-api.vfsglobal.com",
     )
 
     def _handle(client):
@@ -1318,11 +1393,70 @@ async def _do_login() -> dict:
                             return r;
                         }
                     """)
-                    logger.info("Angular diagnostic: %s", diag)
+                    # Mask password in diagnostic output
+                    safe_diag = dict(diag) if diag else {}
+                    if "formControls" in safe_diag:
+                        safe_diag["formControls"] = [
+                            {**fc, "val": "***"} if fc.get("fcn") == "password"
+                            else fc for fc in safe_diag["formControls"]
+                        ]
+                    logger.info("Angular diagnostic: %s", safe_diag)
 
                     logger.info("Requesting CapSolver to solve Turnstile...")
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
+
+                    # ── PRIMARY: Try direct API login (bypasses Angular entirely) ──
+                    logger.info("Attempting direct API login (bypasses Angular form)...")
+                    login_resp = _direct_api_login(token)
+                    if login_resp:
+                        # Extract JWT from response
+                        direct_jwt = None
+                        for key in ("token", "Token", "jwt", "JWT", "authorize",
+                                    "accessToken", "access_token"):
+                            if login_resp.get(key):
+                                direct_jwt = login_resp[key]
+                                break
+                        if direct_jwt:
+                            logger.info("DIRECT LOGIN SUCCESS — JWT obtained (len=%d)", len(direct_jwt))
+                            # Store in captured_headers for later extraction
+                            captured_headers["authorize"] = direct_jwt
+                            # Try to extract clientsource from any response field
+                            for cs_key in ("clientSource", "clientsource", "ClientSource"):
+                                if login_resp.get(cs_key):
+                                    captured_headers["clientsource"] = login_resp[cs_key]
+                                    break
+                            # Navigate to dashboard to capture cookies
+                            try:
+                                await page.goto(
+                                    "https://visa.vfsglobal.com/are/en/prt/dashboard",
+                                    wait_until="load", timeout=30000)
+                            except Exception:
+                                pass
+                            # Extract cookies
+                            cookies_raw = await page.evaluate(
+                                "() => document.cookie || ''")
+                            browser_cookies = await page.context.cookies()
+                            cookie_str = "; ".join(
+                                f"{c['name']}={c['value']}" for c in browser_cookies
+                            ) if browser_cookies else cookies_raw
+
+                            session = {
+                                "authorize": direct_jwt,
+                                "cookies": cookie_str,
+                                "user_agent": await page.evaluate(
+                                    "() => navigator.userAgent"),
+                                "clientsource": captured_headers.get("clientsource", ""),
+                                "login_user": VFS_EMAIL,
+                                "captured_at": datetime.now().isoformat(),
+                                "method": "direct_api",
+                            }
+                            logger.info("Session built via direct API login!")
+                            return session
+                        else:
+                            logger.info("Direct login response had no JWT key, trying form flow...")
+                    else:
+                        logger.info("Direct API login failed, falling back to form flow...")
 
                     # ── SAFETY: Reinstall turnstile fake if trap was lost ──
                     ts_health = await page.evaluate("""
