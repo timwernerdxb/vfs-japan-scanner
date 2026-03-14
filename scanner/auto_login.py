@@ -1055,6 +1055,135 @@ async def _do_login() -> dict:
                         }
                     """, token)
                     logger.info("Fake turnstile installed: %s", install_result)
+
+                    # ── Trigger Angular's Turnstile init ──
+                    # Angular likely registers an onload handler on the volt-recaptcha
+                    # script element. Since api.js loaded in the CF iframe (not main page),
+                    # the onload may not have fired on the main page's script element.
+                    # Dispatch 'load' event to trigger Angular's callback → render().
+                    trigger_result = await page.evaluate("""
+                        () => {
+                            const results = [];
+
+                            // Verify our fake is installed
+                            results.push('ts_type=' + typeof window.turnstile);
+                            results.push('ts_render=' + typeof (window.turnstile && window.turnstile.render));
+
+                            // Find volt-recaptcha or any turnstile script element
+                            const voltScript = document.querySelector(
+                                '#volt-recaptcha, script[src*="turnstile"], script[src*="challenges.cloudflare"]');
+                            if (voltScript) {
+                                results.push('volt_found id=' + voltScript.id +
+                                    ' src=' + (voltScript.src || '').substring(0, 80));
+                                // Dispatch load event to trigger Angular's onload handler
+                                voltScript.dispatchEvent(new Event('load'));
+                                results.push('load_dispatched');
+                            } else {
+                                results.push('volt_not_found');
+                                // List ALL script elements for debugging
+                                const scripts = document.querySelectorAll('script[id], script[src*="cloud"]');
+                                for (const s of scripts) {
+                                    results.push('script:' + (s.id||'no-id') + ' src=' +
+                                        (s.src||'inline').substring(0, 60));
+                                }
+                            }
+
+                            return results;
+                        }
+                    """)
+                    logger.info("Trigger result: %s", trigger_result)
+
+                    # Wait for Angular to potentially call render()
+                    await page.wait_for_timeout(3000)
+
+                    # Check if callback was captured after trigger
+                    cb_after = await page.evaluate("""
+                        () => ({
+                            callback: !!window.__turnstileCallback,
+                            all_cbs: (window.__allTurnstileCallbacks || []).length,
+                            btn_disabled: (() => {
+                                const btns = document.querySelectorAll('button');
+                                for (const b of btns) {
+                                    if ((b.textContent || '').includes('Sign In')) return b.disabled;
+                                }
+                                return null;
+                            })(),
+                        })
+                    """)
+                    logger.info("After trigger: %s", cb_after)
+
+                    # If still no callback, try removing + re-adding the script element
+                    if not cb_after.get("callback"):
+                        logger.info("No callback yet — trying script re-insert...")
+                        reinject = await page.evaluate("""
+                            (token) => {
+                                const results = [];
+                                // Look for existing turnstile/volt script
+                                const existing = document.querySelector(
+                                    '#volt-recaptcha, script[src*="turnstile"]');
+                                if (existing) {
+                                    // Clone it, remove original, re-add
+                                    const parent = existing.parentNode;
+                                    const src = existing.src;
+                                    existing.remove();
+                                    results.push('removed_old src=' + (src||'').substring(0,60));
+
+                                    // Create new script element that loads our fake
+                                    // (or the same URL which our route might intercept)
+                                    const newScript = document.createElement('script');
+                                    newScript.id = 'volt-recaptcha';
+                                    newScript.textContent = `
+                                        // Script re-added — turnstile should already be set
+                                        console.log('VOLT_REINSERT ts_type=' + typeof window.turnstile);
+                                        if (window.turnstile && window.turnstile.ready) {
+                                            window.turnstile.ready(function() {
+                                                console.log('VOLT_REINSERT_READY');
+                                            });
+                                        }
+                                    `;
+                                    parent.appendChild(newScript);
+                                    results.push('reinserted_inline');
+                                } else {
+                                    results.push('no_script_found');
+                                    // Create a fresh script that manually calls render
+                                    const s = document.createElement('script');
+                                    s.textContent = `
+                                        console.log('MANUAL_TS_TRIGGER ts=' + typeof window.turnstile);
+                                        if (window.turnstile) {
+                                            // Find any container elements Angular may have created
+                                            var container = document.querySelector(
+                                                '.cf-turnstile, [data-turnstile], #turnstile-container, ' +
+                                                '[class*=captcha], [id*=captcha], [id*=turnstile]');
+                                            console.log('MANUAL_TS_CONTAINER=' + (container ? container.id || container.className : 'none'));
+                                        }
+                                    `;
+                                    document.body.appendChild(s);
+                                    results.push('manual_script_added');
+                                }
+
+                                // Check callback after a tick
+                                return results;
+                            }
+                        """, token)
+                        logger.info("Re-inject result: %s", reinject)
+                        await page.wait_for_timeout(3000)
+
+                        # Final callback check
+                        cb_final = await page.evaluate("""
+                            () => ({
+                                callback: !!window.__turnstileCallback,
+                                cbs: (window.__allTurnstileCallbacks || []).length,
+                                btn: (() => {
+                                    const btns = document.querySelectorAll('button');
+                                    for (const b of btns) {
+                                        if ((b.textContent || '').includes('Sign In')) return b.disabled;
+                                    }
+                                    return null;
+                                })(),
+                            })
+                        """)
+                        logger.info("Final callback state: %s", cb_final)
+
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
             else:
