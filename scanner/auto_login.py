@@ -397,14 +397,82 @@ async def _do_login() -> dict:
             try { Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'}); } catch(e) {}
             console.log('INIT_STEALTH_DONE');
 
-            // ── CAPTCHA TOKEN STORAGE (set from Python after CapSolver solve) ──
+            // ── CAPTCHA TOKEN + FAKE TURNSTILE ──
+            // Install BEFORE Angular bootstraps so render() is available at init time.
+            // Only on VFS domain — let Cloudflare challenge iframe use real Turnstile.
             try {
                 window.__captchaToken = null;
                 window.__turnstileCallback = null;
                 window.__allTurnstileCallbacks = [];
                 window.__capturedTurnstileSitekey = null;
+
+                if (window.location.hostname.includes('vfsglobal')) {
+                    var _fake = {
+                        render: function(container, options) {
+                            console.log('FAKE_TS_RENDER container=' +
+                                (typeof container === 'string' ? container : 'element'));
+                            if (options) {
+                                if (options.sitekey) {
+                                    window.__capturedTurnstileSitekey = options.sitekey;
+                                    console.log('FAKE_TS_SITEKEY:' + options.sitekey);
+                                }
+                                if (typeof options.callback === 'function') {
+                                    window.__turnstileCallback = options.callback;
+                                    window.__allTurnstileCallbacks.push(options.callback);
+                                    console.log('FAKE_TS_CB_STORED');
+                                    // If token already available, invoke immediately
+                                    if (window.__captchaToken) {
+                                        try {
+                                            options.callback(window.__captchaToken);
+                                            console.log('FAKE_TS_CB_INVOKED_IMMEDIATE');
+                                        } catch(e) { console.log('FAKE_TS_CB_ERR:'+e.message); }
+                                    } else {
+                                        // Poll until Python sets __captchaToken
+                                        console.log('FAKE_TS_POLLING_FOR_TOKEN');
+                                        var pollCb = options.callback;
+                                        var pollId = setInterval(function() {
+                                            if (window.__captchaToken) {
+                                                clearInterval(pollId);
+                                                console.log('FAKE_TS_CB_INVOKED_POLLED');
+                                                try { pollCb(window.__captchaToken); }
+                                                catch(e) { console.log('FAKE_TS_POLL_ERR:'+e.message); }
+                                            }
+                                        }, 200);
+                                        setTimeout(function() { clearInterval(pollId); }, 180000);
+                                    }
+                                }
+                            }
+                            return 'fake_widget_0';
+                        },
+                        execute: function(c, o) {
+                            console.log('FAKE_TS_EXECUTE');
+                            if (o && typeof o.callback === 'function') {
+                                o.callback(window.__captchaToken || '');
+                            }
+                            return window.__captchaToken || '';
+                        },
+                        getResponse: function() { return window.__captchaToken || ''; },
+                        reset: function() { console.log('FAKE_TS_RESET'); },
+                        remove: function() {},
+                        isExpired: function() { return false; },
+                        ready: function(cb) {
+                            console.log('FAKE_TS_READY');
+                            if (typeof cb === 'function') cb();
+                        }
+                    };
+                    // Non-configurable getter/setter: blocks real api.js from overwriting
+                    Object.defineProperty(window, 'turnstile', {
+                        get: function() { return _fake; },
+                        set: function(v) {
+                            console.log('FAKE_TS_BLOCKED_OVERWRITE');
+                        },
+                        configurable: false,
+                        enumerable: true
+                    });
+                    console.log('INIT_FAKE_TS_INSTALLED');
+                }
                 console.log('INIT_CAPTCHA_VARS_OK');
-            } catch(e) { console.log('INIT_CAPTCHA_VARS_FAIL:'+e.message); }
+            } catch(e) { console.log('INIT_CAPTCHA_FAIL:'+e.message); }
 
             // ── SCRIPT TAG OBSERVER ──
             try {
