@@ -534,21 +534,84 @@ async def _do_login() -> dict:
                 console.log('INIT_CAPTCHA_OK ts_type=' + typeof window.turnstile);
             } catch(e) { console.log('INIT_CAPTCHA_FAIL:'+e.message); }
 
-            // ── SCRIPT TAG OBSERVER ──
+            // ── SCRIPT LOAD INTERCEPTION ──
+            // Angular waits for <script id="volt-recaptcha"> 'load' event before
+            // calling turnstile.render(). But the script loads BEFORE Angular
+            // bootstraps → 'load' already fired → Angular's listener never fires
+            // → render() never called → callback never captured.
+            // FIX: Track script loads. When a 'load' listener is added to an
+            // already-loaded script, fire the handler immediately.
             try {
-                const obs = new MutationObserver((mutations) => {
-                    for (const m of mutations) {
-                        for (const node of m.addedNodes) {
+                var _loadedScripts = new WeakSet();
+
+                // Track ALL script load events via capture phase
+                // (capture phase catches non-bubbling 'load' events on descendants)
+                document.addEventListener('load', function(e) {
+                    if (e.target && e.target.tagName === 'SCRIPT') {
+                        _loadedScripts.add(e.target);
+                        console.log('SCRIPT_LOADED:' + (e.target.id || 'anon') +
+                                     ' src=' + (e.target.src || '').substring(0, 80));
+                    }
+                }, true);
+
+                // Override addEventListener: fire 'load' immediately for already-loaded scripts
+                var _origAEL = EventTarget.prototype.addEventListener;
+                EventTarget.prototype.addEventListener = function(type, fn, opts) {
+                    _origAEL.call(this, type, fn, opts);
+                    if (type === 'load' && this instanceof HTMLScriptElement &&
+                        _loadedScripts.has(this)) {
+                        var el = this;
+                        console.log('LATE_LOAD_LISTENER:' + (el.id || 'anon') +
+                                    ' src=' + (el.src || '').substring(0, 60));
+                        setTimeout(function() {
+                            try {
+                                fn.call(el, new Event('load'));
+                                console.log('LATE_LOAD_FIRED:' + (el.id || 'anon'));
+                            } catch(e) {
+                                console.log('LATE_LOAD_ERR:' + e.message);
+                            }
+                        }, 0);
+                    }
+                };
+
+                // MutationObserver for logging script additions
+                var _obs = new MutationObserver(function(mutations) {
+                    for (var mi = 0; mi < mutations.length; mi++) {
+                        var added = mutations[mi].addedNodes;
+                        for (var ni = 0; ni < added.length; ni++) {
+                            var node = added[ni];
                             if (node.tagName === 'SCRIPT' && node.src) {
-                                if (node.src.includes('challenges.cloudflare.com'))
-                                    console.log('SCRIPT_ADDED:'+node.src.substring(0,120));
+                                if (node.src.indexOf('challenges.cloudflare.com') >= 0 ||
+                                    node.id === 'volt-recaptcha') {
+                                    console.log('SCRIPT_ADDED:' + (node.id || 'anon') +
+                                                ' src=' + node.src.substring(0, 120));
+                                }
                             }
                         }
                     }
                 });
-                obs.observe(document.documentElement, {childList: true, subtree: true});
-                console.log('INIT_OBSERVER_OK');
-            } catch(e) { console.log('INIT_OBSERVER_FAIL:'+e.message); }
+                _obs.observe(document.documentElement, {childList: true, subtree: true});
+
+                // Periodic fallback: dispatch 'load' on volt-recaptcha every 5s
+                // until callback is captured (handles edge cases where the capture-
+                // phase tracking missed the load event)
+                var _renderRetry = setInterval(function() {
+                    if (window.__turnstileCallback) {
+                        clearInterval(_renderRetry);
+                        console.log('RENDER_RETRY_DONE: callback captured');
+                        return;
+                    }
+                    var volt = document.getElementById('volt-recaptcha');
+                    if (volt) {
+                        _loadedScripts.add(volt); // ensure it's tracked
+                        volt.dispatchEvent(new Event('load'));
+                        console.log('RENDER_RETRY: dispatched load on volt-recaptcha');
+                    }
+                }, 5000);
+                setTimeout(function() { clearInterval(_renderRetry); }, 120000);
+
+                console.log('INIT_SCRIPT_INTERCEPT_OK');
+            } catch(e) { console.log('INIT_SCRIPT_INTERCEPT_FAIL:' + e.message); }
         }
         """)
 
@@ -616,6 +679,11 @@ async def _do_login() -> dict:
                 logger.info("[console] %s", text)
             # Log script additions (from MutationObserver)
             if text.startswith("SCRIPT_ADDED:"):
+                logger.info("[console] %s", text)
+            # Log script load interception events
+            if text.startswith("SCRIPT_LOADED:") or text.startswith("LATE_LOAD_"):
+                logger.info("[console] %s", text)
+            if text.startswith("RENDER_RETRY"):
                 logger.info("[console] %s", text)
             # Capture sitekey from Turnstile wrapper or fake render
             if "TS_SITEKEY:" in text:
@@ -1047,6 +1115,101 @@ async def _do_login() -> dict:
                             }
                         """, token)
                         logger.info("After load trigger: %s", cb_after)
+
+                        # Poll for callback (script load interception is async)
+                        if not cb_after.get("cb"):
+                            logger.info("Polling for callback capture (up to 10s)...")
+                            for poll_i in range(10):
+                                await page.wait_for_timeout(1000)
+                                cb_poll = await page.evaluate("""
+                                    () => ({
+                                        cb: !!window.__turnstileCallback,
+                                        cbs: (window.__allTurnstileCallbacks || []).length,
+                                    })
+                                """)
+                                if cb_poll.get("cb"):
+                                    logger.info("Callback captured after %ds polling!", poll_i + 1)
+                                    await page.evaluate("""
+                                        (token) => {
+                                            var cbs = window.__allTurnstileCallbacks || [];
+                                            for (var i = 0; i < cbs.length; i++) {
+                                                try { cbs[i](token); } catch(e) {}
+                                            }
+                                            console.log('TS_CB_INVOKED_AFTER_POLL cbs=' + cbs.length);
+                                        }
+                                    """, token)
+                                    break
+                                if (poll_i + 1) % 3 == 0:
+                                    logger.info("Poll %d/10 — still no callback", poll_i + 1)
+
+                        # FALLBACK: Directly patch Angular FormGroup
+                        # If callback STILL not captured, find Angular's reactive
+                        # form and set captcha_api_key directly.
+                        final_cb = await page.evaluate("() => !!window.__turnstileCallback")
+                        if not final_cb:
+                            logger.info("Callback never captured — trying Angular FormGroup fallback...")
+                            fg_result = await page.evaluate("""
+                                (token) => {
+                                    var r = {};
+
+                                    // Check volt-recaptcha element
+                                    var voltEl = document.querySelector('volt-recaptcha');
+                                    r.volt_exists = !!voltEl;
+                                    if (voltEl) {
+                                        r.volt_tag = voltEl.tagName;
+                                        r.volt_ctx_type = typeof voltEl.__ngContext__;
+                                        r.volt_ctx_isArr = Array.isArray(voltEl.__ngContext__);
+                                    }
+
+                                    // Search ALL elements for Angular LView containing FormGroup
+                                    var allEls = document.querySelectorAll('*');
+                                    for (var i = 0; i < allEls.length; i++) {
+                                        var el = allEls[i];
+                                        var ctx = el.__ngContext__;
+                                        if (!Array.isArray(ctx)) continue;
+
+                                        // Walk LView slots looking for FormGroup with captcha_api_key
+                                        for (var j = 0; j < ctx.length && j < 300; j++) {
+                                            try {
+                                                var item = ctx[j];
+                                                if (!item || typeof item !== 'object') continue;
+                                                if (!item.controls) continue;
+                                                if (!item.controls.captcha_api_key) continue;
+
+                                                r.fg_found = true;
+                                                r.fg_host = el.tagName;
+                                                r.fg_idx = j;
+                                                r.fg_controls = Object.keys(item.controls);
+                                                r.fg_status_before = item.status;
+
+                                                // Set captcha values
+                                                item.controls.captcha_api_key.setValue(token);
+                                                if (item.controls.captcha_version) {
+                                                    item.controls.captcha_version.setValue('Turnstile');
+                                                }
+                                                item.updateValueAndValidity();
+                                                r.fg_status_after = item.status;
+                                                r.fg_valid = item.valid;
+                                                console.log('FG_PATCHED status=' + item.status);
+                                                break;
+                                            } catch(e) { /* skip */ }
+                                        }
+                                        if (r.fg_found) break;
+                                    }
+
+                                    // Check button state
+                                    var btns = document.querySelectorAll('button');
+                                    for (var b of btns) {
+                                        if ((b.textContent || '').indexOf('Sign In') >= 0) {
+                                            r.btn_disabled = b.disabled;
+                                            break;
+                                        }
+                                    }
+
+                                    return r;
+                                }
+                            """, token)
+                            logger.info("Angular FormGroup fallback: %s", fg_result)
 
                     # Brief wait then check button state
                     await page.wait_for_timeout(2000)
