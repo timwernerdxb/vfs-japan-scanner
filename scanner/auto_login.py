@@ -336,6 +336,7 @@ async def _do_login() -> dict:
             ),
             locale="en-US",
             timezone_id="Asia/Dubai",
+            ignore_https_errors=True,
         )
         page = await context.new_page()
 
