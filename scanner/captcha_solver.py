@@ -20,7 +20,8 @@ logger = logging.getLogger("captcha_solver")
 
 def _get_api_key() -> str:
     """Read API key at call time (not import time) to handle late env var loading."""
-    key = os.environ.get("CAPSOLVER_API_KEY", "").strip()
+    key = (os.environ.get("CAPSOLVER_API_KEY", "")
+           or os.environ.get("CAP_SOLVER_API_KEY", "")).strip()
     if key:
         logger.info("CapSolver API key loaded (length: %d, starts: %s...)", len(key), key[:8])
     else:
