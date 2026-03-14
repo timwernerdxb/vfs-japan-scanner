@@ -934,6 +934,60 @@ async def _do_login() -> dict:
             else:
                 logger.warning("No Turnstile sitekey found — button may stay disabled")
 
+            # ── APPROACH: Intercept login API + force submit ──
+            # Instead of fighting Angular's form validation, we:
+            # 1. Set up a route interceptor to inject captcha token into any login POST
+            # 2. Try callback injection (if fake turnstile captured it)
+            # 3. Force-enable + click Sign In button
+            # 4. If Angular blocks submission, make the login API call directly
+
+            # Store the solved token for route interception
+            solved_captcha_token = token if sitekey else ""
+
+            # Route interceptor: inject captcha token into login API requests
+            login_api_captured = {}
+
+            async def intercept_login_api(route):
+                """Intercept login POST and inject captcha token."""
+                request = route.request
+                url = request.url
+                method = request.method
+                post_data = request.post_data
+
+                logger.info("[route] Intercepted %s %s", method, url[:100])
+
+                if method == "POST" and post_data:
+                    try:
+                        import json as json_mod
+                        body = json_mod.loads(post_data)
+                        logger.info("[route] POST body keys: %s", list(body.keys()))
+                        login_api_captured["url"] = url
+                        login_api_captured["headers"] = dict(request.headers)
+                        login_api_captured["original_body"] = body.copy()
+
+                        # Inject captcha token into known field names
+                        modified = False
+                        for field in body:
+                            fl = field.lower()
+                            if ("captcha" in fl or "turnstile" in fl or
+                                "recaptcha" in fl or "cf_token" in fl):
+                                if not body[field] or body[field] == "":
+                                    body[field] = solved_captcha_token
+                                    modified = True
+                                    logger.info("[route] Injected token into field: %s", field)
+
+                        if modified:
+                            await route.continue_(post_data=json_mod.dumps(body))
+                            return
+                    except Exception as e:
+                        logger.warning("[route] Parse error: %s", e)
+
+                await route.continue_()
+
+            # Intercept all requests to VFS API
+            await page.route("**/lift-api.vfsglobal.com/**", intercept_login_api)
+            logger.info("Route interceptor set up for login API")
+
             # Click Sign In button
             logger.info("Looking for Sign In button...")
             sign_in = page.locator('button[type="submit"]:has-text("Sign In")')
@@ -950,24 +1004,32 @@ async def _do_login() -> dict:
                     await _log_page_debug(page, "submit-not-found")
                     raise RuntimeError("Could not find submit button")
 
-            # Check if button is enabled (Turnstile token should have enabled it)
+            # Check if button is enabled — wait briefly, then force-enable
             is_disabled = await sign_in.is_disabled()
             if is_disabled:
-                logger.info("Sign In button still disabled — waiting up to 30s...")
-                for wait_i in range(6):  # 6 × 5s = 30s
+                logger.info("Sign In button disabled — waiting 10s for callback...")
+                for wait_i in range(2):  # 2 × 5s = 10s (shorter wait now)
                     await page.wait_for_timeout(5000)
                     if not await sign_in.is_disabled():
                         logger.info("Sign In button is now enabled!")
                         break
-                    logger.info("Still disabled (%d/6)...", wait_i + 1)
+                    logger.info("Still disabled (%d/2)...", wait_i + 1)
                 else:
-                    logger.warning("Force-enabling Sign In button")
+                    logger.warning("Force-enabling Sign In button + form submission")
                     await page.evaluate("""
                         () => {
+                            // Force-enable the button
                             const btn = document.querySelector('button[type="submit"]');
                             if (btn) {
                                 btn.disabled = false;
                                 btn.classList.remove('mat-mdc-button-disabled');
+                                btn.removeAttribute('disabled');
+                            }
+                            // Also try to make Angular's form "valid" by removing validators
+                            // Find all form controls and clear validators
+                            const forms = document.querySelectorAll('form');
+                            for (const f of forms) {
+                                f.noValidate = true;
                             }
                         }
                     """)
@@ -978,23 +1040,184 @@ async def _do_login() -> dict:
             await sign_in.click(force=True)
             logger.info("Clicked Sign In button")
 
-            # Wait for post-login page (dashboard or "Start New Booking" button)
+            # Wait for navigation or API response
             logger.info("Waiting for post-login page...")
+            login_success = False
             try:
-                await page.wait_for_url("**/dashboard", timeout=30000)
+                await page.wait_for_url("**/dashboard", timeout=15000)
                 logger.info("Dashboard loaded — login successful!")
+                login_success = True
             except Exception:
-                # VFS might show "Start New Booking" instead of redirecting to /dashboard
                 try:
                     start_booking = page.get_by_role("button", name="Start New Booking")
-                    await start_booking.wait_for(timeout=10000)
+                    await start_booking.wait_for(timeout=5000)
                     logger.info("Post-login page loaded (Start New Booking visible)")
+                    login_success = True
                 except Exception:
                     current_url = page.url
-                    logger.warning("Did not reach dashboard. Current URL: %s", current_url)
-                    await _log_page_debug(page, "post-login-fail")
-                    if "login" in current_url:
-                        raise RuntimeError(f"Still on login page: {current_url}")
+                    logger.warning("Form click did not navigate. URL: %s", current_url)
+
+            # FALLBACK: If form submission failed, make direct API login call
+            if not login_success and solved_captcha_token:
+                logger.info("Attempting direct API login (bypassing Angular form)...")
+
+                # First, discover the login API endpoint from Angular's code
+                api_result = await page.evaluate("""
+                    async (params) => {
+                        const results = {};
+
+                        // Try common VFS login API endpoints
+                        const endpoints = [
+                            'https://lift-api.vfsglobal.com/user/login',
+                            'https://lift-api.vfsglobal.com/api/login',
+                            'https://lift-api.vfsglobal.com/authentication/login',
+                        ];
+
+                        // Search Angular bundle for the actual login endpoint
+                        const scripts = document.querySelectorAll('script[src]');
+                        for (const s of scripts) {
+                            if (s.src.includes('main') && s.src.endsWith('.js')) {
+                                try {
+                                    const resp = await fetch(s.src);
+                                    const code = await resp.text();
+                                    // Look for login API path
+                                    const patterns = [
+                                        /["']([^"']*\/(?:user\/)?login[^"']*)["']/g,
+                                        /["']([^"']*\/auth[^"']*)["']/g,
+                                    ];
+                                    for (const p of patterns) {
+                                        let m;
+                                        while ((m = p.exec(code)) !== null) {
+                                            if (m[1].startsWith('/') || m[1].startsWith('http')) {
+                                                if (!results.endpoints) results.endpoints = [];
+                                                results.endpoints.push(m[1]);
+                                            }
+                                        }
+                                    }
+                                    // Look for the request body structure
+                                    const bodyMatch = code.match(
+                                        /(?:email|loginId|username).*?(?:password).*?(?:captcha|turnstile|token)/s
+                                    );
+                                    if (bodyMatch) {
+                                        results.bodyHint = bodyMatch[0].substring(0, 200);
+                                    }
+                                } catch(e) {
+                                    results.bundleError = e.message;
+                                }
+                            }
+                        }
+
+                        // Try the login call with various body formats
+                        const tryLogin = async (url, body) => {
+                            try {
+                                const resp = await fetch(url, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Accept': 'application/json',
+                                    },
+                                    body: JSON.stringify(body),
+                                    credentials: 'include',
+                                });
+                                const status = resp.status;
+                                let data = null;
+                                try { data = await resp.json(); } catch(e) {}
+                                return { url, status, data, bodyKeys: Object.keys(body) };
+                            } catch(e) {
+                                return { url, error: e.message };
+                            }
+                        };
+
+                        // Body format 1: email/password/captchaToken
+                        const body1 = {
+                            username: params.email,
+                            password: params.password,
+                            captchaToken: params.token,
+                        };
+                        // Body format 2: loginId/password/turnstileToken
+                        const body2 = {
+                            loginId: params.email,
+                            password: params.password,
+                            turnstileToken: params.token,
+                        };
+                        // Body format 3: email/password/cf-turnstile-response
+                        const body3 = {
+                            email: params.email,
+                            password: params.password,
+                            'cf-turnstile-response': params.token,
+                        };
+
+                        // Try each endpoint with each body format
+                        results.attempts = [];
+                        for (const ep of endpoints) {
+                            for (const body of [body1, body2, body3]) {
+                                const r = await tryLogin(ep, body);
+                                results.attempts.push(r);
+                                if (r.status && r.status >= 200 && r.status < 300) {
+                                    results.success = r;
+                                    return results;
+                                }
+                                // If we got a meaningful error (not 404), stop trying other endpoints
+                                if (r.status && r.status !== 404 && r.status !== 405) {
+                                    results.bestAttempt = r;
+                                }
+                            }
+                        }
+
+                        // Also try any endpoints discovered from the bundle
+                        if (results.endpoints) {
+                            for (const ep of results.endpoints.slice(0, 3)) {
+                                const fullUrl = ep.startsWith('http') ? ep :
+                                    'https://lift-api.vfsglobal.com' + ep;
+                                for (const body of [body1, body2, body3]) {
+                                    const r = await tryLogin(fullUrl, body);
+                                    results.attempts.push(r);
+                                    if (r.status >= 200 && r.status < 300) {
+                                        results.success = r;
+                                        return results;
+                                    }
+                                }
+                            }
+                        }
+
+                        return results;
+                    }
+                """, {"email": VFS_EMAIL, "password": VFS_PASSWORD, "token": solved_captcha_token})
+                logger.info("Direct API login result: %s", api_result)
+
+                # If direct login succeeded, navigate to dashboard to get cookies/JWT
+                if api_result and api_result.get("success"):
+                    success = api_result["success"]
+                    logger.info("Direct API login SUCCESS! Status: %s", success.get("status"))
+                    # Store JWT if returned in response
+                    if success.get("data") and isinstance(success["data"], dict):
+                        for key in ["token", "jwt", "accessToken", "access_token", "authorize"]:
+                            if success["data"].get(key):
+                                captured_headers["authorize"] = success["data"][key]
+                                logger.info("Got JWT from direct API (key: %s)", key)
+                                break
+                    # Navigate to dashboard to pick up cookies
+                    try:
+                        await page.goto("https://visa.vfsglobal.com/are/en/prt/dashboard", timeout=15000)
+                        await page.wait_for_timeout(3000)
+                        login_success = True
+                    except Exception:
+                        pass
+                else:
+                    logger.warning("Direct API login failed: %s",
+                                   api_result.get("bestAttempt") or api_result.get("attempts", [])[:3])
+
+            if not login_success:
+                current_url = page.url
+                await _log_page_debug(page, "post-login-fail")
+                if "login" in current_url:
+                    raise RuntimeError(f"Still on login page: {current_url}")
+
+            # Unroute to avoid intercepting further requests
+            try:
+                await page.unroute("**/lift-api.vfsglobal.com/**")
+            except Exception:
+                pass
 
             await page.wait_for_timeout(3000)
 
