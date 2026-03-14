@@ -892,10 +892,19 @@ async def _do_login() -> dict:
             url = request.url
             if "lift-api.vfsglobal.com" in url:
                 headers = request.headers
+                # Log ALL API requests with key headers (for debugging login)
+                method = request.method
+                safe_headers = {k: v for k, v in headers.items()
+                                if k.lower() in ("authorize", "clientsource", "route",
+                                                  "content-type", "accept")}
+                logger.info("[api-req] %s %s headers=%s", method, url[:100], safe_headers)
                 if headers.get("authorize") and not captured_headers.get("authorize"):
                     captured_headers["authorize"] = headers["authorize"]
-                    captured_headers["clientsource"] = headers.get("clientsource", "")
                     logger.info("Captured authorize token from API request")
+                # Capture clientsource from ANY API request (even without authorize)
+                if headers.get("clientsource") and not captured_headers.get("clientsource"):
+                    captured_headers["clientsource"] = headers["clientsource"]
+                    logger.info("Captured clientsource: %s", headers["clientsource"][:30])
             # Log ALL Cloudflare requests to see if api.js is even fetched
             if "challenges.cloudflare.com" in url:
                 logger.info("[request] %s %s", request.method, url[:120])
@@ -1164,6 +1173,72 @@ async def _do_login() -> dict:
             # Debug: log page state
             page_title = await page.title()
             logger.info("Page loaded — URL: %s | Title: %s", page.url, page_title)
+
+            # ── BUNDLE ANALYSIS: Find login API URL from Angular main.js ──
+            try:
+                login_url_info = await page.evaluate("""
+                    async () => {
+                        const r = {};
+                        // Get all script sources
+                        const scripts = document.querySelectorAll('script[src]');
+                        r.scriptSrcs = [];
+                        for (const s of scripts) {
+                            if (s.src && (s.src.includes('main') || s.src.includes('chunk')))
+                                r.scriptSrcs.push(s.src.substring(0, 120));
+                        }
+                        // Fetch main bundle and search for login-related URLs
+                        for (const s of scripts) {
+                            if (!s.src || !s.src.includes('main')) continue;
+                            try {
+                                const resp = await fetch(s.src);
+                                const text = await resp.text();
+                                // Search for login/authenticate endpoints
+                                const patterns = [
+                                    /["']([\\/\\w-]*login[\\/\\w-]*)["']/gi,
+                                    /["']([\\/\\w-]*auth[\\/\\w-]*)["']/gi,
+                                    /["']([\\/\\w-]*signin[\\/\\w-]*)["']/gi,
+                                    /["']([\\/\\w-]*session[\\/\\w-]*)["']/gi,
+                                ];
+                                r.matches = [];
+                                for (const pat of patterns) {
+                                    let m;
+                                    while ((m = pat.exec(text)) !== null) {
+                                        var val = m[1];
+                                        if (val.length > 3 && val.length < 60 &&
+                                            !val.includes('class') && !val.includes('style'))
+                                            r.matches.push(val);
+                                    }
+                                }
+                                // Deduplicate
+                                r.matches = [...new Set(r.matches)].slice(0, 20);
+                                // Also search for captcha-related patterns
+                                const captchaPatterns = [
+                                    /["'](captcha[\w_]*)["']/gi,
+                                    /["']([\w]*captcha)["']/gi,
+                                ];
+                                r.captchaKeys = [];
+                                for (const pat of captchaPatterns) {
+                                    let m;
+                                    while ((m = pat.exec(text)) !== null) {
+                                        r.captchaKeys.push(m[1]);
+                                    }
+                                }
+                                r.captchaKeys = [...new Set(r.captchaKeys)].slice(0, 10);
+                                r.bundleSize = text.length;
+                                break;
+                            } catch(e) {
+                                r.fetchErr = e.message;
+                            }
+                        }
+                        return r;
+                    }
+                """)
+                logger.info("Bundle analysis — scripts: %s", login_url_info.get("scriptSrcs"))
+                logger.info("Bundle analysis — login matches: %s", login_url_info.get("matches"))
+                logger.info("Bundle analysis — captcha keys: %s", login_url_info.get("captchaKeys"))
+                logger.info("Bundle analysis — size: %s", login_url_info.get("bundleSize"))
+            except Exception as e:
+                logger.info("Bundle analysis failed: %s", e)
 
             if "page-not-found" in page.url or "unable to progress" in page_title.lower():
                 await _log_page_debug(page, "blocked")
@@ -1456,7 +1531,75 @@ async def _do_login() -> dict:
                         else:
                             logger.info("Direct login response had no JWT key, trying form flow...")
                     else:
-                        logger.info("Direct API login failed, falling back to form flow...")
+                        logger.info("Direct API login failed, trying Playwright request...")
+
+                    # ── SECONDARY: Try via Playwright page.request (includes browser cookies) ──
+                    if not captured_headers.get("authorize"):
+                        import json as json_mod
+                        login_body = json_mod.dumps({
+                            "username": VFS_EMAIL,
+                            "password": VFS_PASSWORD,
+                            "captcha_api_key": token,
+                            "captcha_version": "Turnstile",
+                        })
+                        pw_headers = {
+                            "Content-Type": "application/json",
+                            "Accept": "application/json, text/plain, */*",
+                            "Origin": "https://visa.vfsglobal.com",
+                            "Referer": "https://visa.vfsglobal.com/",
+                            "Route": "are/en/prt",
+                        }
+                        if captured_headers.get("clientsource"):
+                            pw_headers["clientsource"] = captured_headers["clientsource"]
+                        for login_url in VFS_LOGIN_URLS:
+                            try:
+                                resp = await page.request.post(
+                                    login_url, data=login_body, headers=pw_headers)
+                                status = resp.status
+                                body_text = await resp.text()
+                                logger.info("PW-login %s → %d: %s",
+                                            login_url, status, body_text[:500])
+                                if status == 200:
+                                    try:
+                                        data = json_mod.loads(body_text)
+                                        for key in ("token", "Token", "jwt", "JWT",
+                                                     "authorize", "accessToken"):
+                                            if data.get(key):
+                                                logger.info("PW-login SUCCESS (key=%s)", key)
+                                                captured_headers["authorize"] = data[key]
+                                                for cs_key in ("clientSource", "clientsource"):
+                                                    if data.get(cs_key):
+                                                        captured_headers["clientsource"] = data[cs_key]
+                                                break
+                                    except Exception as e:
+                                        logger.info("PW-login parse error: %s", e)
+                                if status != 404:
+                                    break  # Got a real response (even if error)
+                            except Exception as e:
+                                logger.info("PW-login %s error: %s", login_url, e)
+
+                    # If we got a JWT from either direct method, build session and return
+                    if captured_headers.get("authorize"):
+                        direct_jwt = captured_headers["authorize"]
+                        logger.info("LOGIN SUCCESS via direct/PW — JWT len=%d", len(direct_jwt))
+                        cookies_raw = await page.evaluate("() => document.cookie || ''")
+                        browser_cookies = await page.context.cookies()
+                        cookie_str = "; ".join(
+                            f"{c['name']}={c['value']}" for c in browser_cookies
+                        ) if browser_cookies else cookies_raw
+                        session = {
+                            "authorize": direct_jwt,
+                            "cookies": cookie_str,
+                            "user_agent": await page.evaluate("() => navigator.userAgent"),
+                            "clientsource": captured_headers.get("clientsource", ""),
+                            "login_user": VFS_EMAIL,
+                            "captured_at": datetime.now().isoformat(),
+                            "method": "direct_api",
+                        }
+                        logger.info("Session built via direct API!")
+                        return session
+
+                    logger.info("Both direct login methods failed — continuing with form flow...")
 
                     # ── SAFETY: Reinstall turnstile fake if trap was lost ──
                     ts_health = await page.evaluate("""
