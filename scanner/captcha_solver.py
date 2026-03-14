@@ -12,12 +12,17 @@ import time
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-CAPSOLVER_API_KEY = os.environ.get("CAPSOLVER_API_KEY", "")
+CAPSOLVER_API_KEY = os.environ.get("CAPSOLVER_API_KEY", "").strip()
 
 CAPSOLVER_CREATE_URL = "https://api.capsolver.com/createTask"
 CAPSOLVER_RESULT_URL = "https://api.capsolver.com/getTaskResult"
 
 logger = logging.getLogger("captcha_solver")
+
+if CAPSOLVER_API_KEY:
+    logger.info("CapSolver API key loaded (length: %d, starts: %s...)", len(CAPSOLVER_API_KEY), CAPSOLVER_API_KEY[:8])
+else:
+    logger.warning("CAPSOLVER_API_KEY not set or empty — Turnstile solving will fail")
 
 
 def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> str:
