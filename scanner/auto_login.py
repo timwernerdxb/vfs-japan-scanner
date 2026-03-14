@@ -806,6 +806,7 @@ async def _do_login() -> dict:
             if not sitekey:
                 logger.warning("No Turnstile sitekey found from any source")
 
+            token = ""  # Will be set if sitekey found and CapSolver succeeds
             if sitekey:
                 try:
                     # Check if our fake turnstile captured the callback
@@ -825,103 +826,147 @@ async def _do_login() -> dict:
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
-                    # Inject token — the fake turnstile should have captured
-                    # Angular's callback, so calling it sets the form control
+                    # Inject token into Angular's reactive form system
+                    # From bundle analysis: the login form uses FormGroup with controls:
+                    #   username, password, captcha_api_key, captcha_version
+                    # Button disabled = loginForm.invalid
+                    # We need to patch captcha_api_key + captcha_version to make form valid
                     inject_result = await page.evaluate("""
                         (token) => {
                             const results = [];
 
-                            // Method 1: Call ALL captured callbacks from our fake turnstile
-                            // This is the primary method — Angular registered its callback
-                            // when it called our fake turnstile.render()
-                            if (window.__turnstileCallback) {
-                                try {
-                                    window.__turnstileCallback(token);
-                                    results.push('primary_callback_called');
-                                } catch(e) { results.push('callback_error:' + e.message); }
-                            }
-                            // Also call any additional callbacks captured
-                            if (window.__allTurnstileCallbacks && window.__allTurnstileCallbacks.length > 0) {
-                                results.push('total_callbacks:' + window.__allTurnstileCallbacks.length);
-                                for (let i = 0; i < window.__allTurnstileCallbacks.length; i++) {
-                                    try {
-                                        window.__allTurnstileCallbacks[i](token);
-                                        results.push('callback_' + i + '_called');
-                                    } catch(e) { results.push('callback_' + i + '_error:' + e.message); }
+                            // === PRIMARY: Patch Angular FormGroup via __ngContext__ ===
+                            // Walk all DOM elements to find the login component
+                            let loginFormGroup = null;
+                            let loginComponent = null;
+                            const allElements = document.querySelectorAll('*');
+
+                            for (const el of allElements) {
+                                const ctx = el.__ngContext__;
+                                if (!ctx) continue;
+
+                                // __ngContext__ can be array (LView) or number (index)
+                                const items = Array.isArray(ctx) ? ctx : [];
+                                for (const item of items) {
+                                    if (!item || typeof item !== 'object') continue;
+
+                                    // Look for component with loginForm property
+                                    if (item.loginForm && item.loginForm.controls) {
+                                        loginComponent = item;
+                                        loginFormGroup = item.loginForm;
+                                        results.push('FOUND_LOGIN_COMPONENT');
+                                        break;
+                                    }
+
+                                    // Or find FormGroup with username + password controls
+                                    if (item.controls && item.controls.username &&
+                                        item.controls.password) {
+                                        loginFormGroup = item;
+                                        results.push('FOUND_FORM_GROUP_DIRECT');
+                                        break;
+                                    }
                                 }
-                            } else {
-                                results.push('NO_CALLBACKS_CAPTURED');
+                                if (loginFormGroup) break;
                             }
 
-                            // Method 2: Set hidden input values + dispatch Angular events
+                            if (loginFormGroup) {
+                                const controlNames = Object.keys(loginFormGroup.controls);
+                                results.push('form_controls:' + controlNames.join(','));
+
+                                // Set captcha_api_key (the CAPTCHA token field)
+                                if (loginFormGroup.controls.captcha_api_key) {
+                                    loginFormGroup.controls.captcha_api_key.setValue(token);
+                                    loginFormGroup.controls.captcha_api_key.markAsDirty();
+                                    loginFormGroup.controls.captcha_api_key.markAsTouched();
+                                    // Clear required validator so form becomes valid
+                                    if (loginFormGroup.controls.captcha_api_key.clearValidators) {
+                                        loginFormGroup.controls.captcha_api_key.clearValidators();
+                                    }
+                                    loginFormGroup.controls.captcha_api_key.updateValueAndValidity();
+                                    results.push('SET_captcha_api_key');
+                                } else {
+                                    // Control doesn't exist yet — try patchValue (ignores missing)
+                                    try {
+                                        loginFormGroup.patchValue({ captcha_api_key: token });
+                                        results.push('PATCHED_captcha_api_key');
+                                    } catch(e) { results.push('patch_error:' + e.message); }
+                                }
+
+                                // Set captcha_version
+                                if (loginFormGroup.controls.captcha_version) {
+                                    // Try to get the correct version string from the component
+                                    let version = 'Turnstile';
+                                    if (loginComponent && loginComponent.captchaVersionConst) {
+                                        // captchaVersionConst: {default:'v3', alternate:'v2', cloudflare:'...'}
+                                        version = loginComponent.captchaVersionConst.cloudflare ||
+                                                  loginComponent.captchaVersionConst.alternate ||
+                                                  'Turnstile';
+                                        results.push('version_from_const:' + version);
+                                    }
+                                    loginFormGroup.controls.captcha_version.setValue(version);
+                                    loginFormGroup.controls.captcha_version.updateValueAndValidity();
+                                    results.push('SET_captcha_version:' + version);
+                                }
+
+                                // Update entire form validity
+                                loginFormGroup.updateValueAndValidity();
+                                results.push('form_valid:' + loginFormGroup.valid);
+                                results.push('form_status:' + loginFormGroup.status);
+                            }
+
+                            // Set component-level captcha properties
+                            if (loginComponent) {
+                                loginComponent.captchaToken = token;
+                                if (loginComponent.captchaVersionConst) {
+                                    loginComponent.currentCaptcha =
+                                        loginComponent.captchaVersionConst.cloudflare ||
+                                        loginComponent.captchaVersionConst.alternate;
+                                }
+                                // Ensure allowedCaptcha is set (needed for submission)
+                                if (loginComponent.allowedCaptcha !== undefined) {
+                                    results.push('allowedCaptcha:' + loginComponent.allowedCaptcha);
+                                }
+                                results.push('SET_component_captchaToken');
+                            }
+
+                            // === FALLBACK A: If form still invalid, disable captcha requirement ===
+                            if (loginFormGroup && !loginFormGroup.valid && loginComponent) {
+                                results.push('FORM_STILL_INVALID_trying_bypass');
+
+                                // Clear validators on all captcha-related controls
+                                for (const cn of Object.keys(loginFormGroup.controls)) {
+                                    const lower = cn.toLowerCase();
+                                    if (lower.includes('captcha') || lower.includes('token') ||
+                                        lower.includes('turnstile') || lower.includes('otp')) {
+                                        const ctrl = loginFormGroup.controls[cn];
+                                        if (ctrl.clearValidators) ctrl.clearValidators();
+                                        ctrl.setErrors(null);
+                                        ctrl.updateValueAndValidity();
+                                        results.push('cleared_validator:' + cn);
+                                    }
+                                }
+                                loginFormGroup.updateValueAndValidity();
+                                results.push('form_valid_after_clear:' + loginFormGroup.valid);
+                            }
+
+                            // === FALLBACK B: Set hidden inputs (legacy approach) ===
                             const names = ['cf-turnstile-response', 'g-recaptcha-response'];
                             for (const name of names) {
                                 const input = document.querySelector('[name="' + name + '"]');
                                 if (input) {
-                                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                        window.HTMLInputElement.prototype, 'value').set;
-                                    nativeInputValueSetter.call(input, token);
+                                    const setter = Object.getOwnPropertyDescriptor(
+                                        HTMLInputElement.prototype, 'value').set;
+                                    setter.call(input, token);
                                     input.dispatchEvent(new Event('input', {bubbles: true}));
                                     input.dispatchEvent(new Event('change', {bubbles: true}));
                                     results.push('input_set:' + name);
                                 }
                             }
 
-                            // Method 3: Override turnstile.getResponse to return our token
+                            // === FALLBACK C: Override turnstile.getResponse ===
                             if (window.turnstile) {
                                 window.turnstile.getResponse = () => token;
                                 results.push('getResponse_overridden');
-                            }
-
-                            // Method 4: Find Angular components via __ngContext__
-                            try {
-                                const allElements = document.querySelectorAll('*');
-                                for (const el of allElements) {
-                                    if (el.__ngContext__) {
-                                        // Walk the context array looking for objects with form-like properties
-                                        for (const item of el.__ngContext__) {
-                                            if (item && typeof item === 'object' && item.controls) {
-                                                // Found a FormGroup!
-                                                const controlNames = Object.keys(item.controls);
-                                                results.push('ng_formgroup_found:' + controlNames.join(','));
-                                                // Try to set any captcha/token related control
-                                                for (const cn of controlNames) {
-                                                    const lower = cn.toLowerCase();
-                                                    if (lower.includes('captcha') || lower.includes('token') ||
-                                                        lower.includes('turnstile') || lower.includes('recaptcha')) {
-                                                        item.controls[cn].setValue(token);
-                                                        item.controls[cn].markAsDirty();
-                                                        item.controls[cn].updateValueAndValidity();
-                                                        results.push('ng_control_set:' + cn);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } catch(e) { results.push('ng_context_error:' + e.message); }
-
-                            // Method 5: Find data-callback on Turnstile containers
-                            const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                            for (const c of containers) {
-                                const cbName = c.getAttribute('data-callback');
-                                if (cbName && typeof window[cbName] === 'function') {
-                                    window[cbName](token);
-                                    results.push('data_callback:' + cbName);
-                                }
-                            }
-
-                            // Method 6: Search window for any captcha/turnstile callback functions
-                            for (const key of Object.keys(window)) {
-                                if ((key.toLowerCase().includes('captcha') ||
-                                     key.toLowerCase().includes('turnstile')) &&
-                                    typeof window[key] === 'function' &&
-                                    key !== '__turnstileCallback') {
-                                    try {
-                                        window[key](token);
-                                        results.push('window_fn:' + key);
-                                    } catch(e) {}
-                                }
                             }
 
                             return results;
@@ -934,17 +979,11 @@ async def _do_login() -> dict:
             else:
                 logger.warning("No Turnstile sitekey found — button may stay disabled")
 
-            # ── APPROACH: Intercept login API + force submit ──
-            # Instead of fighting Angular's form validation, we:
-            # 1. Set up a route interceptor to inject captcha token into any login POST
-            # 2. Try callback injection (if fake turnstile captured it)
-            # 3. Force-enable + click Sign In button
-            # 4. If Angular blocks submission, make the login API call directly
-
-            # Store the solved token for route interception
+            # ── ROUTE INTERCEPTOR: Inject captcha token into login API POST ──
+            # Set up BEFORE form interaction so it's ready when Angular submits.
+            # From bundle analysis: VFS expects captcha_api_key + captcha_version in body.
             solved_captcha_token = token if sitekey else ""
 
-            # Route interceptor: inject captcha token into login API requests
             login_api_captured = {}
 
             async def intercept_login_api(route):
@@ -965,18 +1004,32 @@ async def _do_login() -> dict:
                         login_api_captured["headers"] = dict(request.headers)
                         login_api_captured["original_body"] = body.copy()
 
-                        # Inject captcha token into known field names
                         modified = False
-                        for field in body:
+                        # Inject captcha token into existing empty fields
+                        for field in list(body.keys()):
                             fl = field.lower()
                             if ("captcha" in fl or "turnstile" in fl or
                                 "recaptcha" in fl or "cf_token" in fl):
                                 if not body[field] or body[field] == "":
                                     body[field] = solved_captcha_token
                                     modified = True
-                                    logger.info("[route] Injected token into field: %s", field)
+                                    logger.info("[route] Injected token into existing field: %s", field)
+
+                        # ADD captcha fields if they're missing entirely
+                        # From bundle analysis: VFS expects captcha_api_key + captcha_version
+                        if "username" in body or "password" in body:
+                            # This looks like a login request
+                            if "captcha_api_key" not in body:
+                                body["captcha_api_key"] = solved_captcha_token
+                                modified = True
+                                logger.info("[route] Added captcha_api_key to login body")
+                            if "captcha_version" not in body:
+                                body["captcha_version"] = "Turnstile"
+                                modified = True
+                                logger.info("[route] Added captcha_version to login body")
 
                         if modified:
+                            logger.info("[route] Final body keys: %s", list(body.keys()))
                             await route.continue_(post_data=json_mod.dumps(body))
                             return
                     except Exception as e:
@@ -1057,155 +1110,104 @@ async def _do_login() -> dict:
                     current_url = page.url
                     logger.warning("Form click did not navigate. URL: %s", current_url)
 
-            # FALLBACK: If form submission failed, make direct API login call
+            # FALLBACK: If form submission failed, try re-patching and resubmitting
             if not login_success and solved_captcha_token:
-                logger.info("Attempting direct API login (bypassing Angular form)...")
+                logger.info("Form click didn't navigate — trying deeper Angular patching...")
 
-                # First, discover the login API endpoint from Angular's code
-                api_result = await page.evaluate("""
-                    async (params) => {
-                        const results = {};
+                # Try to find and fix the form one more time
+                retry_result = await page.evaluate("""
+                    (token) => {
+                        const results = [];
 
-                        // Try common VFS login API endpoints
-                        const endpoints = [
-                            'https://lift-api.vfsglobal.com/user/login',
-                            'https://lift-api.vfsglobal.com/api/login',
-                            'https://lift-api.vfsglobal.com/authentication/login',
-                        ];
+                        // Deep walk: search ALL objects in ALL __ngContext__ arrays
+                        const visited = new WeakSet();
+                        function findFormGroups(obj, depth) {
+                            if (!obj || depth > 5 || typeof obj !== 'object') return;
+                            if (visited.has(obj)) return;
+                            try { visited.add(obj); } catch(e) { return; }
 
-                        // Search Angular bundle for the actual login endpoint
-                        const scripts = document.querySelectorAll('script[src]');
-                        for (const s of scripts) {
-                            if (s.src.includes('main') && s.src.endsWith('.js')) {
-                                try {
-                                    const resp = await fetch(s.src);
-                                    const code = await resp.text();
-                                    // Look for login API path
-                                    const patterns = [
-                                        /["']([^"']*\/(?:user\/)?login[^"']*)["']/g,
-                                        /["']([^"']*\/auth[^"']*)["']/g,
-                                    ];
-                                    for (const p of patterns) {
-                                        let m;
-                                        while ((m = p.exec(code)) !== null) {
-                                            if (m[1].startsWith('/') || m[1].startsWith('http')) {
-                                                if (!results.endpoints) results.endpoints = [];
-                                                results.endpoints.push(m[1]);
-                                            }
+                            // Check if this is a FormGroup
+                            if (obj.controls && typeof obj.controls === 'object' &&
+                                !Array.isArray(obj.controls)) {
+                                const keys = Object.keys(obj.controls);
+                                if (keys.includes('username') || keys.includes('password')) {
+                                    results.push('DEEP_FOUND_FORM:' + keys.join(','));
+
+                                    // Set captcha fields
+                                    for (const cn of keys) {
+                                        const lower = cn.toLowerCase();
+                                        if (lower.includes('captcha') || lower.includes('token')) {
+                                            obj.controls[cn].setValue(token);
+                                            if (obj.controls[cn].clearValidators)
+                                                obj.controls[cn].clearValidators();
+                                            obj.controls[cn].setErrors(null);
+                                            obj.controls[cn].updateValueAndValidity();
+                                            results.push('DEEP_SET:' + cn);
                                         }
                                     }
-                                    // Look for the request body structure
-                                    const bodyMatch = code.match(
-                                        /(?:email|loginId|username).*?(?:password).*?(?:captcha|turnstile|token)/s
-                                    );
-                                    if (bodyMatch) {
-                                        results.bodyHint = bodyMatch[0].substring(0, 200);
+
+                                    // Clear ALL validators to force form valid
+                                    for (const cn of keys) {
+                                        const ctrl = obj.controls[cn];
+                                        if (ctrl.clearValidators) ctrl.clearValidators();
+                                        ctrl.setErrors(null);
+                                        ctrl.updateValueAndValidity();
                                     }
-                                } catch(e) {
-                                    results.bundleError = e.message;
+                                    obj.updateValueAndValidity();
+                                    results.push('DEEP_form_valid:' + obj.valid);
+                                }
+                            }
+
+                            // Recurse into object properties
+                            if (Array.isArray(obj)) {
+                                for (const item of obj) {
+                                    findFormGroups(item, depth + 1);
+                                }
+                            } else {
+                                for (const key of Object.keys(obj).slice(0, 50)) {
+                                    try { findFormGroups(obj[key], depth + 1); }
+                                    catch(e) {}
                                 }
                             }
                         }
 
-                        // Try the login call with various body formats
-                        const tryLogin = async (url, body) => {
-                            try {
-                                const resp = await fetch(url, {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json',
-                                        'Accept': 'application/json',
-                                    },
-                                    body: JSON.stringify(body),
-                                    credentials: 'include',
-                                });
-                                const status = resp.status;
-                                let data = null;
-                                try { data = await resp.json(); } catch(e) {}
-                                return { url, status, data, bodyKeys: Object.keys(body) };
-                            } catch(e) {
-                                return { url, error: e.message };
-                            }
-                        };
-
-                        // Body format 1: email/password/captchaToken
-                        const body1 = {
-                            username: params.email,
-                            password: params.password,
-                            captchaToken: params.token,
-                        };
-                        // Body format 2: loginId/password/turnstileToken
-                        const body2 = {
-                            loginId: params.email,
-                            password: params.password,
-                            turnstileToken: params.token,
-                        };
-                        // Body format 3: email/password/cf-turnstile-response
-                        const body3 = {
-                            email: params.email,
-                            password: params.password,
-                            'cf-turnstile-response': params.token,
-                        };
-
-                        // Try each endpoint with each body format
-                        results.attempts = [];
-                        for (const ep of endpoints) {
-                            for (const body of [body1, body2, body3]) {
-                                const r = await tryLogin(ep, body);
-                                results.attempts.push(r);
-                                if (r.status && r.status >= 200 && r.status < 300) {
-                                    results.success = r;
-                                    return results;
-                                }
-                                // If we got a meaningful error (not 404), stop trying other endpoints
-                                if (r.status && r.status !== 404 && r.status !== 405) {
-                                    results.bestAttempt = r;
-                                }
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            if (el.__ngContext__) {
+                                findFormGroups(el.__ngContext__, 0);
                             }
                         }
 
-                        // Also try any endpoints discovered from the bundle
-                        if (results.endpoints) {
-                            for (const ep of results.endpoints.slice(0, 3)) {
-                                const fullUrl = ep.startsWith('http') ? ep :
-                                    'https://lift-api.vfsglobal.com' + ep;
-                                for (const body of [body1, body2, body3]) {
-                                    const r = await tryLogin(fullUrl, body);
-                                    results.attempts.push(r);
-                                    if (r.status >= 200 && r.status < 300) {
-                                        results.success = r;
-                                        return results;
-                                    }
-                                }
-                            }
+                        // Force-enable button again
+                        const btn = document.querySelector('button[type="submit"]');
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.classList.remove('mat-mdc-button-disabled');
+                            btn.removeAttribute('disabled');
+                            results.push('button_force_enabled');
                         }
 
                         return results;
                     }
-                """, {"email": VFS_EMAIL, "password": VFS_PASSWORD, "token": solved_captcha_token})
-                logger.info("Direct API login result: %s", api_result)
+                """, solved_captcha_token)
+                logger.info("Deep Angular patch result: %s", retry_result)
 
-                # If direct login succeeded, navigate to dashboard to get cookies/JWT
-                if api_result and api_result.get("success"):
-                    success = api_result["success"]
-                    logger.info("Direct API login SUCCESS! Status: %s", success.get("status"))
-                    # Store JWT if returned in response
-                    if success.get("data") and isinstance(success["data"], dict):
-                        for key in ["token", "jwt", "accessToken", "access_token", "authorize"]:
-                            if success["data"].get(key):
-                                captured_headers["authorize"] = success["data"][key]
-                                logger.info("Got JWT from direct API (key: %s)", key)
-                                break
-                    # Navigate to dashboard to pick up cookies
+                # Click submit again
+                await page.wait_for_timeout(1000)
+                try:
+                    await sign_in.click(force=True)
+                    logger.info("Re-clicked Sign In button")
+
+                    # Wait for navigation
                     try:
-                        await page.goto("https://visa.vfsglobal.com/are/en/prt/dashboard", timeout=15000)
-                        await page.wait_for_timeout(3000)
+                        await page.wait_for_url("**/dashboard", timeout=15000)
+                        logger.info("Dashboard loaded after retry!")
                         login_success = True
                     except Exception:
-                        pass
-                else:
-                    logger.warning("Direct API login failed: %s",
-                                   api_result.get("bestAttempt") or api_result.get("attempts", [])[:3])
+                        current_url = page.url
+                        logger.warning("Still no navigation after retry. URL: %s", current_url)
+                except Exception as e:
+                    logger.warning("Re-click failed: %s", e)
 
             if not login_success:
                 current_url = page.url
