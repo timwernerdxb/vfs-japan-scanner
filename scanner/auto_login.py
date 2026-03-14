@@ -169,12 +169,13 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                     pass
 
     # Route these hosts through the upstream proxy.
-    # challenges.cloudflare.com MUST go through the residential proxy too —
-    # Cloudflare's Turnstile API script refuses to initialize from datacenter IPs.
+    # Do NOT add challenges.cloudflare.com — Bright Data returns 402
+    # "Residential Failed (bad_endpoint)" for CAPTCHA challenge domains.
+    # Cloudflare challenges go DIRECT from Railway — this works fine now
+    # that the Object.defineProperty hook is removed.
     PROXY_DOMAINS = (
         "visa.vfsglobal.com",
         "lift-api.vfsglobal.com",
-        "challenges.cloudflare.com",
     )
 
     def _handle(client):
