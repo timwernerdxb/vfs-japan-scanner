@@ -449,6 +449,9 @@ async def _do_login() -> dict:
                     captured_headers["authorize"] = headers["authorize"]
                     captured_headers["clientsource"] = headers.get("clientsource", "")
                     logger.info("Captured authorize token from API request")
+            # Log ALL Cloudflare requests to see if api.js is even fetched
+            if "challenges.cloudflare.com" in url:
+                logger.info("[request] %s %s", request.method, url[:120])
             # Capture Turnstile sitekey from challenge requests
             if "challenges.cloudflare.com" in url and "sitekey=" in url:
                 import re
@@ -693,73 +696,162 @@ async def _do_login() -> dict:
                 raise RuntimeError("Could not find password input field")
 
             # Solve Turnstile CAPTCHA via CapSolver
-            # Now that we're NOT blocking Turnstile with Object.defineProperty,
-            # it should initialize normally. Poll for the sitekey.
-            logger.info("Waiting for Turnstile to initialize (no longer blocking it)...")
+            # Strategy: quick poll for widget render, then fallback to searching
+            # Angular bundles and manually fetching api.js if needed.
+            logger.info("Waiting for Turnstile to initialize...")
             sitekey = None
-            for ts_wait in range(40):  # 40 × 3s = 120s max
-                # Check all sources for sitekey
+
+            # Phase 1: Quick poll (30s) — check if widget renders naturally
+            for ts_wait in range(10):  # 10 × 3s = 30s
                 sitekey = await page.evaluate("""
                     () => {
-                        // From our render() wrapper hook
                         if (window.__capturedTurnstileSitekey) return window.__capturedTurnstileSitekey;
-                        // From DOM elements
                         const el = document.querySelector('.cf-turnstile, [data-sitekey]');
                         if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
-                        // From Turnstile iframes
                         const iframes = document.querySelectorAll('iframe');
                         for (const f of iframes) {
                             const m = f.src && f.src.match(/sitekey=([^&]+)/);
                             if (m) return m[1];
                         }
-                        // From inline scripts
-                        const scripts = document.querySelectorAll('script');
-                        for (const s of scripts) {
-                            if (s.textContent) {
-                                const m = s.textContent.match(/sitekey['"]?\s*[:=]\s*['"]?(0x[a-fA-F0-9]+)/);
-                                if (m) return m[1];
-                            }
-                        }
                         return null;
                     }
                 """)
                 if sitekey:
-                    logger.info("Turnstile sitekey found (attempt %d): %s...", ts_wait + 1, sitekey[:16])
+                    logger.info("Turnstile sitekey found (phase 1, attempt %d): %s...", ts_wait + 1, sitekey[:16])
                     break
-                # Also check network capture
                 if captured_turnstile_sitekey.get("key"):
                     sitekey = captured_turnstile_sitekey["key"]
-                    logger.info("Turnstile sitekey via network (attempt %d): %s...", ts_wait + 1, sitekey[:16])
                     break
-                # Log detailed status every 9s (every 3rd iteration)
                 if (ts_wait + 1) % 3 == 0:
                     ts_status = await page.evaluate("""
-                        () => {
-                            const vs = document.querySelector('#volt-recaptcha');
-                            return {
-                                turnstileType: typeof window.turnstile,
-                                turnstileKeys: window.turnstile ? Object.keys(window.turnstile).slice(0, 10) : [],
-                                hookCaptured: window.__capturedTurnstileSitekey,
-                                cfDivs: document.querySelectorAll('.cf-turnstile').length,
-                                sitekeyEls: document.querySelectorAll('[data-sitekey]').length,
-                                iframes: Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(s => s),
-                                voltScript: vs ? {
-                                    src: vs.src,
-                                    async: vs.async,
-                                    defer: vs.defer,
-                                    type: vs.type,
-                                    readyState: vs.readyState || 'n/a',
-                                } : null,
-                                scriptErrors: Array.from(document.querySelectorAll('script')).filter(s =>
-                                    s.src && s.src.includes('challenges.cloudflare.com')
-                                ).map(s => ({src: s.src, loaded: s.readyState || 'n/a'})),
-                            };
-                        }
+                        () => ({
+                            turnstile: typeof window.turnstile,
+                            iframes: document.querySelectorAll('iframe').length,
+                        })
                     """)
-                    logger.info("Turnstile wait %d/40 — status: %s", ts_wait + 1, ts_status)
+                    logger.info("Turnstile phase 1 wait %d/10 — %s", ts_wait + 1, ts_status)
                 await page.wait_for_timeout(3000)
-            else:
-                logger.warning("Turnstile sitekey not found after 120s")
+
+            # Phase 2: Search Angular bundles for hardcoded sitekey
+            if not sitekey:
+                logger.info("Phase 2: Searching Angular bundles for sitekey...")
+                sitekey = await page.evaluate("""
+                    async () => {
+                        // Search inline scripts
+                        const scripts = document.querySelectorAll('script');
+                        for (const s of scripts) {
+                            if (s.textContent) {
+                                const m = s.textContent.match(/sitekey['"]?\\s*[:=]\\s*['"]?(0x[a-fA-F0-9]+)/);
+                                if (m) return m[1];
+                            }
+                        }
+
+                        // Fetch and search Angular bundle files for sitekey
+                        const scriptSrcs = Array.from(scripts)
+                            .map(s => s.src)
+                            .filter(s => s && (s.includes('main') || s.includes('app') || s.includes('chunk')));
+                        for (const src of scriptSrcs) {
+                            try {
+                                const resp = await fetch(src);
+                                const text = await resp.text();
+                                // Look for Turnstile sitekey pattern (0x followed by hex)
+                                const m = text.match(/['"]?(0x4AAA[a-zA-Z0-9_-]+)['"]?/);
+                                if (m) return m[1];
+                                // Broader pattern
+                                const m2 = text.match(/sitekey['"]?\\s*[:=]\\s*['"]?(0x[a-fA-F0-9]+)/);
+                                if (m2) return m2[1];
+                                // Look for turnstile render call
+                                const m3 = text.match(/turnstile.*?['"]?(0x[a-fA-F0-9]{8,})['"]?/);
+                                if (m3) return m3[1];
+                            } catch(e) {}
+                        }
+
+                        // Check environment/config objects
+                        if (window.__env && window.__env.turnstileSitekey) return window.__env.turnstileSitekey;
+                        if (window.__config && window.__config.turnstileSitekey) return window.__config.turnstileSitekey;
+
+                        return null;
+                    }
+                """)
+                if sitekey:
+                    logger.info("Sitekey found in Angular bundle: %s...", sitekey[:16])
+
+            # Phase 3: Manually fetch + eval api.js if turnstile still undefined
+            if not sitekey:
+                logger.info("Phase 3: Manually fetching and evaluating api.js...")
+                eval_result = await page.evaluate("""
+                    async () => {
+                        try {
+                            const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/api.js');
+                            const status = resp.status;
+                            const text = await resp.text();
+                            const size = text.length;
+
+                            // Check if the response looks like JavaScript
+                            const isJS = text.trimStart().startsWith('(') ||
+                                         text.trimStart().startsWith('/') ||
+                                         text.trimStart().startsWith('!') ||
+                                         text.trimStart().startsWith('var') ||
+                                         text.trimStart().startsWith('window');
+
+                            if (status === 200 && isJS && size > 100) {
+                                // Eval the script to create window.turnstile
+                                eval(text);
+                                return {
+                                    status: status,
+                                    size: size,
+                                    turnstileAfterEval: typeof window.turnstile,
+                                    start: text.substring(0, 100)
+                                };
+                            }
+                            return {
+                                status: status,
+                                size: size,
+                                isJS: isJS,
+                                start: text.substring(0, 200)
+                            };
+                        } catch(e) {
+                            return {error: e.message};
+                        }
+                    }
+                """)
+                logger.info("Manual api.js fetch result: %s", eval_result)
+
+                # If eval worked, check for turnstile and try to get sitekey
+                if eval_result and eval_result.get("turnstileAfterEval") == "object":
+                    logger.info("Turnstile initialized via manual eval! Waiting for render...")
+                    # Wait for VFS to call render (now that turnstile exists)
+                    for post_wait in range(10):
+                        sitekey = await page.evaluate("""
+                            () => window.__capturedTurnstileSitekey
+                        """)
+                        if sitekey:
+                            logger.info("Sitekey captured after manual eval: %s...", sitekey[:16])
+                            break
+                        if captured_turnstile_sitekey.get("key"):
+                            sitekey = captured_turnstile_sitekey["key"]
+                            break
+                        await page.wait_for_timeout(3000)
+
+            # Phase 4: Last resort — look for sitekey in page HTML source
+            if not sitekey:
+                logger.info("Phase 4: Searching full page HTML for sitekey...")
+                sitekey = await page.evaluate("""
+                    () => {
+                        const html = document.documentElement.outerHTML;
+                        // Look for any 0x-prefixed hex string that looks like a sitekey
+                        const m = html.match(/0x4AAA[a-zA-Z0-9_-]{20,}/);
+                        if (m) return m[0];
+                        const m2 = html.match(/0x[0-9a-fA-F]{22,}/);
+                        if (m2) return m2[0];
+                        return null;
+                    }
+                """)
+                if sitekey:
+                    logger.info("Sitekey found in page HTML: %s...", sitekey[:16])
+
+            if not sitekey:
+                logger.warning("All 4 phases failed — no Turnstile sitekey found")
 
             if sitekey:
                 try:
