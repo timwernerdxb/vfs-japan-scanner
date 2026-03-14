@@ -405,36 +405,74 @@ async def _do_login() -> dict:
             // Platform
             Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
 
-            // NON-INVASIVE Turnstile capture:
-            // Do NOT use Object.defineProperty on window.turnstile — it blocks
-            // Cloudflare's script from initializing. Instead, poll until
-            // window.turnstile.render exists, then wrap it to capture sitekey.
+            // FAKE TURNSTILE: Cloudflare's api.js never creates window.turnstile
+            // in headless (bot detection). So we create a fake one BEFORE the page
+            // loads. When Angular's component calls turnstile.render(), we capture
+            // the callback. Later, we call it with our CapSolver-solved token.
+            // This is NOT Object.defineProperty — just a plain assignment that
+            // Angular will find and use.
             window.__capturedTurnstileSitekey = null;
             window.__turnstileCallback = null;
             window.__turnstileWidgetId = null;
-            (function() {
-                let wrapped = false;
-                const poll = setInterval(() => {
-                    if (window.turnstile && window.turnstile.render && !wrapped) {
-                        wrapped = true;
-                        const origRender = window.turnstile.render.bind(window.turnstile);
-                        window.turnstile.render = function(container, options) {
-                            if (options && options.sitekey) {
-                                window.__capturedTurnstileSitekey = options.sitekey;
-                                window.__turnstileCallback = options.callback || null;
-                                console.log('TURNSTILE_SITEKEY_CAPTURED:' + options.sitekey);
-                            }
-                            const widgetId = origRender.apply(this, arguments);
-                            window.__turnstileWidgetId = widgetId;
-                            return widgetId;
-                        };
-                        console.log('TURNSTILE_RENDER_WRAPPED');
-                        clearInterval(poll);
+            window.__allTurnstileCallbacks = [];
+            window.turnstile = {
+                render: function(container, options) {
+                    console.log('FAKE_TURNSTILE_RENDER called with container=' +
+                                (typeof container === 'string' ? container : container?.id || 'element'));
+                    if (options) {
+                        console.log('FAKE_TURNSTILE_RENDER options: ' + JSON.stringify({
+                            sitekey: options.sitekey,
+                            callback: typeof options.callback,
+                            action: options.action,
+                            theme: options.theme
+                        }));
+                        if (options.sitekey) {
+                            window.__capturedTurnstileSitekey = options.sitekey;
+                            console.log('TURNSTILE_SITEKEY_CAPTURED:' + options.sitekey);
+                        }
+                        if (options.callback) {
+                            window.__turnstileCallback = options.callback;
+                            window.__allTurnstileCallbacks.push(options.callback);
+                            console.log('TURNSTILE_CALLBACK_CAPTURED');
+                        }
                     }
-                }, 100);
-                // Stop polling after 120s
-                setTimeout(() => clearInterval(poll), 120000);
-            })();
+                    window.__turnstileWidgetId = 'fake-widget-0';
+                    return 'fake-widget-0';
+                },
+                getResponse: function(id) { return ''; },
+                reset: function(id) { console.log('FAKE_TURNSTILE_RESET'); },
+                remove: function(id) { console.log('FAKE_TURNSTILE_REMOVE'); },
+                isExpired: function(id) { return false; },
+                execute: function(container, options) {
+                    console.log('FAKE_TURNSTILE_EXECUTE called');
+                    // Some implementations use execute instead of render
+                    if (options && options.callback) {
+                        window.__turnstileCallback = options.callback;
+                        window.__allTurnstileCallbacks.push(options.callback);
+                    }
+                    return 'fake-widget-0';
+                }
+            };
+            console.log('FAKE_TURNSTILE installed on window.turnstile');
+
+            // Protect against Cloudflare api.js overwriting our fake.
+            // Re-check every second and re-install if needed.
+            const _fakeTurnstile = window.turnstile;
+            const _protectInterval = setInterval(() => {
+                if (!window.turnstile || !window.turnstile.__isFake) {
+                    // Cloudflare overwrote or deleted our fake — reinstall
+                    // but keep the callback if we captured one
+                    const savedCb = window.__turnstileCallback;
+                    const savedCbs = window.__allTurnstileCallbacks || [];
+                    window.turnstile = _fakeTurnstile;
+                    window.__turnstileCallback = savedCb;
+                    window.__allTurnstileCallbacks = savedCbs;
+                    console.log('FAKE_TURNSTILE re-installed (was overwritten)');
+                }
+            }, 500);
+            window.turnstile.__isFake = true;
+            // Stop protection after 60s (by then Angular has already called render)
+            setTimeout(() => clearInterval(_protectInterval), 60000);
         }
         """)
 
@@ -749,36 +787,100 @@ async def _do_login() -> dict:
 
             if sitekey:
                 try:
+                    # Check if our fake turnstile captured the callback
+                    callback_status = await page.evaluate("""
+                        () => ({
+                            hasCallback: !!window.__turnstileCallback,
+                            callbackType: typeof window.__turnstileCallback,
+                            totalCallbacks: window.__allTurnstileCallbacks ? window.__allTurnstileCallbacks.length : 0,
+                            capturedSitekey: window.__capturedTurnstileSitekey,
+                            widgetId: window.__turnstileWidgetId,
+                            turnstileExists: !!window.turnstile,
+                        })
+                    """)
+                    logger.info("Fake turnstile status: %s", callback_status)
+
                     logger.info("Requesting CapSolver to solve Turnstile...")
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
-                    # Inject token — must trigger the Angular form callback
+                    # Inject token — the fake turnstile should have captured
+                    # Angular's callback, so calling it sets the form control
                     inject_result = await page.evaluate("""
                         (token) => {
                             const results = [];
 
-                            // Method 1: Call the captured callback from our hook
+                            // Method 1: Call ALL captured callbacks from our fake turnstile
+                            // This is the primary method — Angular registered its callback
+                            // when it called our fake turnstile.render()
                             if (window.__turnstileCallback) {
                                 try {
                                     window.__turnstileCallback(token);
-                                    results.push('callback_called');
+                                    results.push('primary_callback_called');
                                 } catch(e) { results.push('callback_error:' + e.message); }
                             }
+                            // Also call any additional callbacks captured
+                            if (window.__allTurnstileCallbacks && window.__allTurnstileCallbacks.length > 0) {
+                                results.push('total_callbacks:' + window.__allTurnstileCallbacks.length);
+                                for (let i = 0; i < window.__allTurnstileCallbacks.length; i++) {
+                                    try {
+                                        window.__allTurnstileCallbacks[i](token);
+                                        results.push('callback_' + i + '_called');
+                                    } catch(e) { results.push('callback_' + i + '_error:' + e.message); }
+                                }
+                            } else {
+                                results.push('NO_CALLBACKS_CAPTURED');
+                            }
 
-                            // Method 2: Set hidden input values + dispatch events
+                            // Method 2: Set hidden input values + dispatch Angular events
                             const names = ['cf-turnstile-response', 'g-recaptcha-response'];
                             for (const name of names) {
                                 const input = document.querySelector('[name="' + name + '"]');
                                 if (input) {
-                                    input.value = token;
+                                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                        window.HTMLInputElement.prototype, 'value').set;
+                                    nativeInputValueSetter.call(input, token);
                                     input.dispatchEvent(new Event('input', {bubbles: true}));
                                     input.dispatchEvent(new Event('change', {bubbles: true}));
                                     results.push('input_set:' + name);
                                 }
                             }
 
-                            // Method 3: Find Turnstile container and trigger callback
+                            // Method 3: Override turnstile.getResponse to return our token
+                            if (window.turnstile) {
+                                window.turnstile.getResponse = () => token;
+                                results.push('getResponse_overridden');
+                            }
+
+                            // Method 4: Find Angular components via __ngContext__
+                            try {
+                                const allElements = document.querySelectorAll('*');
+                                for (const el of allElements) {
+                                    if (el.__ngContext__) {
+                                        // Walk the context array looking for objects with form-like properties
+                                        for (const item of el.__ngContext__) {
+                                            if (item && typeof item === 'object' && item.controls) {
+                                                // Found a FormGroup!
+                                                const controlNames = Object.keys(item.controls);
+                                                results.push('ng_formgroup_found:' + controlNames.join(','));
+                                                // Try to set any captcha/token related control
+                                                for (const cn of controlNames) {
+                                                    const lower = cn.toLowerCase();
+                                                    if (lower.includes('captcha') || lower.includes('token') ||
+                                                        lower.includes('turnstile') || lower.includes('recaptcha')) {
+                                                        item.controls[cn].setValue(token);
+                                                        item.controls[cn].markAsDirty();
+                                                        item.controls[cn].updateValueAndValidity();
+                                                        results.push('ng_control_set:' + cn);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch(e) { results.push('ng_context_error:' + e.message); }
+
+                            // Method 5: Find data-callback on Turnstile containers
                             const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
                             for (const c of containers) {
                                 const cbName = c.getAttribute('data-callback');
@@ -788,18 +890,18 @@ async def _do_login() -> dict:
                                 }
                             }
 
-                            // Method 4: Search for Angular reactive form integration
-                            // VFS uses ngModel or formControl — look for hidden textarea
-                            const textareas = document.querySelectorAll('textarea[name*="turnstile"], textarea[name*="captcha"]');
-                            for (const ta of textareas) {
-                                ta.value = token;
-                                ta.dispatchEvent(new Event('input', {bubbles: true}));
-                                results.push('textarea_set');
+                            // Method 6: Search window for any captcha/turnstile callback functions
+                            for (const key of Object.keys(window)) {
+                                if ((key.toLowerCase().includes('captcha') ||
+                                     key.toLowerCase().includes('turnstile')) &&
+                                    typeof window[key] === 'function' &&
+                                    key !== '__turnstileCallback') {
+                                    try {
+                                        window[key](token);
+                                        results.push('window_fn:' + key);
+                                    } catch(e) {}
+                                }
                             }
-
-                            // Method 5: Dispatch custom event (some Angular integrations listen for this)
-                            window.dispatchEvent(new CustomEvent('turnstile-callback', {detail: {token}}));
-                            results.push('custom_event');
 
                             return results;
                         }
