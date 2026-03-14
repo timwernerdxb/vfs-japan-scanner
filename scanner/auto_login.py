@@ -66,8 +66,8 @@ async def _extract_turnstile_sitekey(page) -> str:
     """)
 
     if not sitekey:
-        # Fallback: check env var
-        sitekey = os.environ.get("VFS_TURNSTILE_SITEKEY", "")
+        # Fallback: check env var or use known VFS sitekey
+        sitekey = os.environ.get("VFS_TURNSTILE_SITEKEY", "0x4AAAAAABhlz7Ei4byodYjs")
 
     if not sitekey:
         raise RuntimeError("Could not find Turnstile sitekey on page")
@@ -893,6 +893,8 @@ async def _do_login() -> dict:
                 logger.info("[console] %s", text)
             if text.startswith("SELF_RENDER"):
                 logger.info("[console] %s", text)
+            if text.startswith("FAKE_API_JS_LOADED"):
+                logger.info("[console] %s", text)
             # Capture sitekey from Turnstile wrapper or fake render
             if "TS_SITEKEY:" in text:
                 key = text.split("TS_SITEKEY:")[1].strip()
@@ -1205,43 +1207,37 @@ async def _do_login() -> dict:
             logger.info("Waiting for Turnstile sitekey from network/DOM...")
             sitekey = None
 
-            for ts_wait in range(20):  # 20 × 3s = 60s max
-                # Check network capture (most reliable — sitekey in URL path)
+            # With api.js route-intercepted, the sitekey won't appear in
+            # network URLs (Cloudflare challenge never initiates). But our fake
+            # turnstile.render() captures it when Angular calls render().
+            # Quick check (3 attempts × 2s = 6s max), then use known default.
+            KNOWN_VFS_SITEKEY = "0x4AAAAAABhlz7Ei4byodYjs"
+
+            for ts_wait in range(3):  # 3 × 2s = 6s max
+                # Check network capture (works if api.js wasn't intercepted)
                 if captured_turnstile_sitekey.get("key"):
                     sitekey = captured_turnstile_sitekey["key"]
                     logger.info("Sitekey from network capture: %s", sitekey)
                     break
-                # Check DOM / init script hook
+                # Check main-world fake turnstile (set by our route-intercepted api.js)
                 sitekey = await page.evaluate("""
                     () => {
                         if (window.__capturedTurnstileSitekey) return window.__capturedTurnstileSitekey;
                         const el = document.querySelector('.cf-turnstile, [data-sitekey]');
                         if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
-                        // Check Turnstile iframes for sitekey in src
-                        const iframes = document.querySelectorAll('iframe');
-                        for (const f of iframes) {
-                            if (f.src) {
-                                let m = f.src.match(/sitekey=([^&]+)/);
-                                if (m) return m[1];
-                                m = f.src.match(/\\/(0x4[a-zA-Z0-9_-]{10,})\\/?/);
-                                if (m) return m[1];
-                            }
-                        }
                         return null;
                     }
                 """)
                 if sitekey:
-                    logger.info("Sitekey from DOM (attempt %d): %s", ts_wait + 1, sitekey)
+                    logger.info("Sitekey from DOM/fake (attempt %d): %s", ts_wait + 1, sitekey)
                     break
-                if (ts_wait + 1) % 5 == 0:
-                    logger.info("Sitekey wait %d/20 — not found yet", ts_wait + 1)
-                await page.wait_for_timeout(3000)
+                logger.info("Sitekey wait %d/3 — not found yet", ts_wait + 1)
+                await page.wait_for_timeout(2000)
 
-            # Fallback: env var or hardcoded (sitekeys rarely change)
+            # Fallback: env var or known hardcoded (sitekeys rarely change)
             if not sitekey:
-                sitekey = os.environ.get("VFS_TURNSTILE_SITEKEY", "")
-                if sitekey:
-                    logger.info("Using sitekey from env var: %s", sitekey)
+                sitekey = os.environ.get("VFS_TURNSTILE_SITEKEY", KNOWN_VFS_SITEKEY)
+                logger.info("Using fallback sitekey: %s", sitekey)
 
             if not sitekey:
                 logger.warning("No Turnstile sitekey found from any source")
