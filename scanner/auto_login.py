@@ -397,11 +397,13 @@ async def _do_login() -> dict:
             try { Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'}); } catch(e) {}
             console.log('INIT_STEALTH_DONE');
 
-            // ── CAPTCHA: Wrap real Turnstile render() to capture Angular's callback ──
-            // Strategy: Let real api.js load and set window.turnstile normally.
-            // Wrap render() to capture Angular's callback. After CapSolver solve,
-            // Python invokes the callback with the solved token.
-            // IMPORTANT: configurable:true so real api.js can set/redefine freely.
+            // ── CAPTCHA: Pre-built fake Turnstile that Angular finds immediately ──
+            // KEY INSIGHT: In headless, real api.js never sets window.turnstile
+            // (CF challenge fails — no WebGL, /pat/ returns 401). Angular checks
+            // for window.turnstile during bootstrap, finds undefined, and skips.
+            // FIX: The getter returns a pre-built fake when _realTs is undefined.
+            // Angular finds the fake, calls render(), we capture the callback.
+            // CapSolver token arrives later → we invoke the captured callback.
             try {
                 window.__captchaToken = null;
                 window.__turnstileCallback = null;
@@ -411,64 +413,113 @@ async def _do_login() -> dict:
 
                 console.log('INIT_HOST:' + window.location.hostname);
 
+                // Pre-built fake turnstile that captures Angular's callback
+                var _fakeTs = {
+                    render: function(container, options) {
+                        console.log('FAKE_TS_RENDER container=' +
+                            (typeof container === 'string' ? container : 'element'));
+                        if (options) {
+                            if (options.sitekey) {
+                                window.__capturedTurnstileSitekey = options.sitekey;
+                                console.log('FAKE_TS_SITEKEY:' + options.sitekey);
+                            }
+                            if (typeof options.callback === 'function') {
+                                window.__turnstileCallback = options.callback;
+                                window.__allTurnstileCallbacks.push(options.callback);
+                                console.log('FAKE_TS_CB_CAPTURED total=' +
+                                    window.__allTurnstileCallbacks.length);
+                                // If token already solved (race condition), invoke now
+                                if (window.__captchaToken) {
+                                    try {
+                                        options.callback(window.__captchaToken);
+                                        console.log('FAKE_TS_CB_INVOKED_IMMEDIATE');
+                                    } catch(e) { console.log('FAKE_TS_CB_ERR:'+e.message); }
+                                }
+                            }
+                            // Suppress error callback — our fake never errors
+                            if (options['error-callback']) {
+                                options['error-callback'] = function() {
+                                    console.log('FAKE_TS_ERROR_SUPPRESSED');
+                                };
+                            }
+                            // Suppress expired callback
+                            if (options['expired-callback']) {
+                                options['expired-callback'] = function() {
+                                    console.log('FAKE_TS_EXPIRED_SUPPRESSED');
+                                };
+                            }
+                        }
+                        return 'fake_widget_0';
+                    },
+                    execute: function(container, options) {
+                        console.log('FAKE_TS_EXECUTE');
+                        if (options && typeof options.callback === 'function') {
+                            window.__turnstileCallback = options.callback;
+                            window.__allTurnstileCallbacks.push(options.callback);
+                            console.log('FAKE_TS_EXEC_CB_CAPTURED');
+                            if (window.__captchaToken) {
+                                options.callback(window.__captchaToken);
+                            }
+                        }
+                        return window.__captchaToken || '';
+                    },
+                    getResponse: function() {
+                        return window.__captchaToken || '';
+                    },
+                    reset: function() { console.log('FAKE_TS_RESET'); },
+                    remove: function() {},
+                    isExpired: function() { return false; },
+                    ready: function(cb) {
+                        console.log('FAKE_TS_READY');
+                        if (typeof cb === 'function') cb();
+                    },
+                    __wrapped: true
+                };
+
+                // Wrapper for real turnstile (if it ever arrives)
                 function _wrapTurnstile(ts) {
                     if (!ts || typeof ts !== 'object' || ts.__wrapped) return;
                     if (typeof ts.render === 'function') {
                         var origRender = ts.render.bind(ts);
                         ts.render = function(container, options) {
-                            console.log('TS_RENDER_INTERCEPTED container=' +
-                                (typeof container === 'string' ? container : 'element'));
+                            console.log('TS_REAL_RENDER_INTERCEPTED');
                             if (options) {
                                 if (options.sitekey) {
                                     window.__capturedTurnstileSitekey = options.sitekey;
-                                    console.log('TS_SITEKEY:' + options.sitekey);
                                 }
                                 if (typeof options.callback === 'function') {
                                     window.__turnstileCallback = options.callback;
                                     window.__allTurnstileCallbacks.push(options.callback);
-                                    console.log('TS_CB_CAPTURED');
-                                    // If token already solved, invoke immediately
+                                    console.log('TS_REAL_CB_CAPTURED');
                                     if (window.__captchaToken) {
                                         try {
                                             options.callback(window.__captchaToken);
-                                            console.log('TS_CB_INVOKED_IMMEDIATE');
-                                        } catch(e) { console.log('TS_CB_ERR:'+e.message); }
+                                            console.log('TS_REAL_CB_INVOKED');
+                                        } catch(e) {}
                                     }
                                 }
-                                // Suppress error/expired callbacks so challenge failure is silent
                                 if (options['error-callback']) {
-                                    var origErr = options['error-callback'];
                                     options['error-callback'] = function() {
-                                        console.log('TS_ERROR_CB_SUPPRESSED');
+                                        console.log('TS_REAL_ERROR_SUPPRESSED');
                                     };
                                 }
                             }
                             try { return origRender(container, options); }
-                            catch(e) { console.log('TS_RENDER_ERR:'+e.message); return 'w0'; }
-                        };
-                    }
-                    if (typeof ts.execute === 'function') {
-                        var origExec = ts.execute.bind(ts);
-                        ts.execute = function(c, o) {
-                            console.log('TS_EXECUTE_INTERCEPTED');
-                            if (o && typeof o.callback === 'function') {
-                                window.__turnstileCallback = o.callback;
-                                console.log('TS_EXEC_CB_CAPTURED');
-                            }
-                            try { return origExec(c, o); }
-                            catch(e) { return ''; }
+                            catch(e) { return 'w0'; }
                         };
                     }
                     ts.__wrapped = true;
                     window.__tsWrapped = true;
-                    console.log('TS_WRAPPED_OK');
+                    console.log('TS_REAL_WRAPPED_OK');
                 }
 
-                // Getter/setter trap — configurable:true so real api.js can work
+                // Getter/setter trap:
+                // - getter returns real turnstile if set, otherwise returns fake
+                // - setter wraps real turnstile when api.js sets it
                 var _realTs = undefined;
                 try {
                     Object.defineProperty(window, 'turnstile', {
-                        get: function() { return _realTs; },
+                        get: function() { return _realTs || _fakeTs; },
                         set: function(v) {
                             console.log('TS_SET type=' + typeof v);
                             _realTs = v;
@@ -477,23 +528,10 @@ async def _do_login() -> dict:
                         configurable: true,
                         enumerable: true
                     });
-                    console.log('INIT_TS_TRAP_OK');
+                    console.log('INIT_TS_TRAP_OK (fake ready)');
                 } catch(e) { console.log('INIT_TS_TRAP_FAIL:'+e.message); }
 
-                // Polling fallback: if api.js uses defineProperty to replace our trap,
-                // poll for window.turnstile and wrap it when found
-                var _pollId = setInterval(function() {
-                    try {
-                        var t = window.turnstile;
-                        if (t && typeof t === 'object' && !t.__wrapped) {
-                            _wrapTurnstile(t);
-                            console.log('TS_POLL_WRAPPED');
-                        }
-                    } catch(e) {}
-                }, 300);
-                setTimeout(function() { clearInterval(_pollId); }, 120000);
-
-                console.log('INIT_CAPTCHA_OK');
+                console.log('INIT_CAPTCHA_OK ts_type=' + typeof window.turnstile);
             } catch(e) { console.log('INIT_CAPTCHA_FAIL:'+e.message); }
 
             // ── SCRIPT TAG OBSERVER ──
@@ -922,46 +960,38 @@ async def _do_login() -> dict:
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
                     # ── SET TOKEN + INVOKE CAPTURED CALLBACK ──
-                    # The init script's getter/setter trap wraps window.turnstile's
-                    # render() to capture Angular's callback. Now that we have the
-                    # CapSolver token, set it and invoke the callback if captured.
-                    # If callback not yet captured, trigger Angular to call render().
+                    # The init script's fake turnstile is always present via the
+                    # getter (returns _fakeTs when _realTs is undefined). Angular
+                    # should have already found it and called render() during
+                    # bootstrap, capturing the callback in __turnstileCallback.
+                    # Now we set the token and invoke the callback.
                     inject_result = await page.evaluate("""
                         (token) => {
                             const r = {};
                             window.__captchaToken = token;
                             r.token_set = true;
 
-                            // Check init script's wrapper state
+                            // Check state
                             r.ts_type = typeof window.turnstile;
                             r.ts_wrapped = !!(window.turnstile && window.turnstile.__wrapped);
                             r.cb_captured = !!window.__turnstileCallback;
                             r.all_cbs = (window.__allTurnstileCallbacks || []).length;
                             r.sitekey = window.__capturedTurnstileSitekey || null;
 
-                            // If callback was already captured by the wrapper, invoke it
-                            if (window.__turnstileCallback) {
-                                try {
-                                    window.__turnstileCallback(token);
-                                    r.cb_invoked = true;
-                                    console.log('TS_CB_INVOKED_FROM_PYTHON');
-                                } catch(e) {
-                                    r.cb_err = e.message;
-                                    console.log('TS_CB_INVOKE_ERR:' + e.message);
-                                }
-                            }
-
-                            // Also try invoking ALL captured callbacks
+                            // Invoke ALL captured callbacks with token
                             var cbs = window.__allTurnstileCallbacks || [];
                             r.cbs_invoked = 0;
                             for (var i = 0; i < cbs.length; i++) {
                                 try {
                                     cbs[i](token);
                                     r.cbs_invoked++;
-                                } catch(e) {}
+                                    console.log('TS_CB_INVOKED idx=' + i);
+                                } catch(e) {
+                                    console.log('TS_CB_INVOKE_ERR idx=' + i + ': ' + e.message);
+                                }
                             }
 
-                            // Check button state
+                            // Check button state after invoking callbacks
                             var btns = document.querySelectorAll('button');
                             for (var b of btns) {
                                 if ((b.textContent || '').includes('Sign In')) {
@@ -975,19 +1005,19 @@ async def _do_login() -> dict:
                     """, token)
                     logger.info("Token inject result: %s", inject_result)
 
-                    # If no callback captured yet, trigger Angular to call render()
+                    # If no callback was captured, Angular may not have called
+                    # render() yet. Try dispatching 'load' on volt-recaptcha
+                    # to trigger Angular's onload handler.
                     if not inject_result.get("cb_captured"):
-                        logger.info("No callback captured yet — triggering Turnstile init...")
-
-                        # Strategy 1: Dispatch 'load' event on volt-recaptcha script
+                        logger.info("No callback captured — dispatching load event...")
                         trigger_result = await page.evaluate("""
                             () => {
                                 const r = {};
-                                var voltScript = document.querySelector(
-                                    '#volt-recaptcha, script[src*="turnstile"], script[src*="challenges.cloudflare"]');
-                                if (voltScript) {
-                                    r.volt = voltScript.id + ' src=' + (voltScript.src || '').substring(0, 80);
-                                    voltScript.dispatchEvent(new Event('load'));
+                                var volt = document.querySelector(
+                                    '#volt-recaptcha, script[src*="turnstile"]');
+                                if (volt) {
+                                    r.volt = volt.id + ' src=' + (volt.src||'').substring(0,80);
+                                    volt.dispatchEvent(new Event('load'));
                                     r.load_dispatched = true;
                                 } else {
                                     r.volt = 'not_found';
@@ -998,122 +1028,33 @@ async def _do_login() -> dict:
                         logger.info("Load trigger: %s", trigger_result)
                         await page.wait_for_timeout(3000)
 
-                        # Check again
-                        cb_state = await page.evaluate("""
-                            () => ({
-                                cb: !!window.__turnstileCallback,
-                                cbs: (window.__allTurnstileCallbacks || []).length,
-                                ts: typeof window.turnstile,
-                                wrapped: !!(window.turnstile && window.turnstile.__wrapped),
-                            })
-                        """)
-                        logger.info("After load trigger: %s", cb_state)
-
-                        # If callback now captured, invoke it
-                        if cb_state.get("cb"):
-                            await page.evaluate("""
-                                (token) => {
+                        # Check if callback appeared after load dispatch
+                        cb_after = await page.evaluate("""
+                            (token) => {
+                                var r = {
+                                    cb: !!window.__turnstileCallback,
+                                    cbs: (window.__allTurnstileCallbacks || []).length,
+                                };
+                                // Invoke if captured
+                                if (window.__turnstileCallback) {
                                     try {
                                         window.__turnstileCallback(token);
-                                        console.log('TS_CB_INVOKED_AFTER_TRIGGER');
-                                    } catch(e) { console.log('TS_CB_TRIGGER_ERR:'+e.message); }
+                                        r.invoked = true;
+                                        console.log('TS_CB_INVOKED_AFTER_LOAD');
+                                    } catch(e) { r.err = e.message; }
                                 }
-                            """, token)
-                            logger.info("Callback invoked after load trigger")
+                                return r;
+                            }
+                        """, token)
+                        logger.info("After load trigger: %s", cb_after)
 
-                        # Strategy 2: If STILL no callback, install a fallback fake
-                        # that captures + invokes when Angular eventually calls render()
-                        if not cb_state.get("cb"):
-                            logger.info("Still no callback — installing fallback fake turnstile...")
-                            fallback_result = await page.evaluate("""
-                                (token) => {
-                                    const r = {};
-                                    // Build a fake that captures + immediately invokes
-                                    var fake = {
-                                        render: function(container, options) {
-                                            console.log('FALLBACK_TS_RENDER');
-                                            if (options) {
-                                                if (options.sitekey) {
-                                                    window.__capturedTurnstileSitekey = options.sitekey;
-                                                    console.log('FALLBACK_TS_SITEKEY:' + options.sitekey);
-                                                }
-                                                if (typeof options.callback === 'function') {
-                                                    window.__turnstileCallback = options.callback;
-                                                    window.__allTurnstileCallbacks.push(options.callback);
-                                                    console.log('FALLBACK_TS_CB_CAPTURED');
-                                                    try {
-                                                        options.callback(token);
-                                                        console.log('FALLBACK_TS_CB_INVOKED');
-                                                    } catch(e) {
-                                                        console.log('FALLBACK_TS_CB_ERR:' + e.message);
-                                                    }
-                                                }
-                                                if (options['error-callback']) {
-                                                    options['error-callback'] = function() {
-                                                        console.log('FALLBACK_TS_ERR_SUPPRESSED');
-                                                    };
-                                                }
-                                            }
-                                            return 'fallback_w0';
-                                        },
-                                        execute: function(c, o) {
-                                            console.log('FALLBACK_TS_EXECUTE');
-                                            if (o && typeof o.callback === 'function') {
-                                                o.callback(token);
-                                            }
-                                            return token;
-                                        },
-                                        getResponse: function() { return token; },
-                                        reset: function() { console.log('FALLBACK_TS_RESET'); },
-                                        remove: function() {},
-                                        isExpired: function() { return false; },
-                                        ready: function(cb) {
-                                            console.log('FALLBACK_TS_READY');
-                                            if (typeof cb === 'function') cb();
-                                        },
-                                        __wrapped: true  // prevent init script from re-wrapping
-                                    };
-
-                                    // Use configurable:true so it doesn't break anything
-                                    try {
-                                        Object.defineProperty(window, 'turnstile', {
-                                            value: fake,
-                                            writable: true,
-                                            configurable: true,
-                                            enumerable: true
-                                        });
-                                        r.installed = 'defineProperty';
-                                    } catch(e) {
-                                        try {
-                                            window.turnstile = fake;
-                                            r.installed = 'direct';
-                                        } catch(e2) {
-                                            r.installed = 'failed:' + e2.message;
-                                        }
-                                    }
-
-                                    // Now dispatch load to trigger Angular
-                                    var volt = document.querySelector('#volt-recaptcha');
-                                    if (volt) {
-                                        volt.dispatchEvent(new Event('load'));
-                                        r.load_dispatched = true;
-                                    }
-
-                                    r.ts_type = typeof window.turnstile;
-                                    return r;
-                                }
-                            """, token)
-                            logger.info("Fallback fake result: %s", fallback_result)
-                            await page.wait_for_timeout(3000)
-
-                    # Final state check after all strategies
-                    await page.wait_for_timeout(1000)
-                    final_state = await page.evaluate("""
+                    # Brief wait then check button state
+                    await page.wait_for_timeout(2000)
+                    pre_click = await page.evaluate("""
                         () => ({
                             cb: !!window.__turnstileCallback,
                             cbs: (window.__allTurnstileCallbacks || []).length,
                             ts_type: typeof window.turnstile,
-                            ts_wrapped: !!(window.turnstile && window.turnstile.__wrapped),
                             token: !!window.__captchaToken,
                             btn_disabled: (() => {
                                 var btns = document.querySelectorAll('button');
@@ -1124,7 +1065,7 @@ async def _do_login() -> dict:
                             })(),
                         })
                     """)
-                    logger.info("Pre-click state: %s", final_state)
+                    logger.info("Pre-click state: %s", pre_click)
 
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
