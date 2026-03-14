@@ -453,12 +453,17 @@ async def _do_login() -> dict:
             if "challenges.cloudflare.com" in url:
                 logger.info("[request] %s %s", request.method, url[:120])
             # Capture Turnstile sitekey from challenge requests
-            if "challenges.cloudflare.com" in url and "sitekey=" in url:
+            # Sitekey appears in URL PATH like: /turnstile/f/.../0x4AAAA.../
+            # or as query param: sitekey=0x4AAAA...
+            if "challenges.cloudflare.com" in url:
                 import re
-                m = re.search(r"sitekey=([^&]+)", url)
+                # Path pattern: /0x followed by hex/alphanumeric
+                m = re.search(r"/(0x4[a-zA-Z0-9_-]{10,})/?", url)
+                if not m:
+                    m = re.search(r"sitekey=([^&]+)", url)
                 if m and not captured_turnstile_sitekey.get("key"):
                     captured_turnstile_sitekey["key"] = m.group(1)
-                    logger.info("Captured Turnstile sitekey from request URL: %s", m.group(1)[:12])
+                    logger.info("Captured Turnstile sitekey from request URL: %s", m.group(1))
 
         page.on("request", on_request)
 
@@ -696,162 +701,51 @@ async def _do_login() -> dict:
                 raise RuntimeError("Could not find password input field")
 
             # Solve Turnstile CAPTCHA via CapSolver
-            # Strategy: quick poll for widget render, then fallback to searching
-            # Angular bundles and manually fetching api.js if needed.
-            logger.info("Waiting for Turnstile to initialize...")
+            # The sitekey is captured from Cloudflare network requests (URL path
+            # contains /0x4AAAA.../). Wait briefly for it, then try DOM + iframe.
+            logger.info("Waiting for Turnstile sitekey from network/DOM...")
             sitekey = None
 
-            # Phase 1: Quick poll (30s) — check if widget renders naturally
-            for ts_wait in range(10):  # 10 × 3s = 30s
+            for ts_wait in range(20):  # 20 × 3s = 60s max
+                # Check network capture (most reliable — sitekey in URL path)
+                if captured_turnstile_sitekey.get("key"):
+                    sitekey = captured_turnstile_sitekey["key"]
+                    logger.info("Sitekey from network capture: %s", sitekey)
+                    break
+                # Check DOM / init script hook
                 sitekey = await page.evaluate("""
                     () => {
                         if (window.__capturedTurnstileSitekey) return window.__capturedTurnstileSitekey;
                         const el = document.querySelector('.cf-turnstile, [data-sitekey]');
                         if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
+                        // Check Turnstile iframes for sitekey in src
                         const iframes = document.querySelectorAll('iframe');
                         for (const f of iframes) {
-                            const m = f.src && f.src.match(/sitekey=([^&]+)/);
-                            if (m) return m[1];
+                            if (f.src) {
+                                let m = f.src.match(/sitekey=([^&]+)/);
+                                if (m) return m[1];
+                                m = f.src.match(/\\/(0x4[a-zA-Z0-9_-]{10,})\\/?/);
+                                if (m) return m[1];
+                            }
                         }
                         return null;
                     }
                 """)
                 if sitekey:
-                    logger.info("Turnstile sitekey found (phase 1, attempt %d): %s...", ts_wait + 1, sitekey[:16])
+                    logger.info("Sitekey from DOM (attempt %d): %s", ts_wait + 1, sitekey)
                     break
-                if captured_turnstile_sitekey.get("key"):
-                    sitekey = captured_turnstile_sitekey["key"]
-                    break
-                if (ts_wait + 1) % 3 == 0:
-                    ts_status = await page.evaluate("""
-                        () => ({
-                            turnstile: typeof window.turnstile,
-                            iframes: document.querySelectorAll('iframe').length,
-                        })
-                    """)
-                    logger.info("Turnstile phase 1 wait %d/10 — %s", ts_wait + 1, ts_status)
+                if (ts_wait + 1) % 5 == 0:
+                    logger.info("Sitekey wait %d/20 — not found yet", ts_wait + 1)
                 await page.wait_for_timeout(3000)
 
-            # Phase 2: Search Angular bundles for hardcoded sitekey
+            # Fallback: env var or hardcoded (sitekeys rarely change)
             if not sitekey:
-                logger.info("Phase 2: Searching Angular bundles for sitekey...")
-                sitekey = await page.evaluate("""
-                    async () => {
-                        // Search inline scripts
-                        const scripts = document.querySelectorAll('script');
-                        for (const s of scripts) {
-                            if (s.textContent) {
-                                const m = s.textContent.match(/sitekey['"]?\\s*[:=]\\s*['"]?(0x[a-fA-F0-9]+)/);
-                                if (m) return m[1];
-                            }
-                        }
-
-                        // Fetch and search Angular bundle files for sitekey
-                        const scriptSrcs = Array.from(scripts)
-                            .map(s => s.src)
-                            .filter(s => s && (s.includes('main') || s.includes('app') || s.includes('chunk')));
-                        for (const src of scriptSrcs) {
-                            try {
-                                const resp = await fetch(src);
-                                const text = await resp.text();
-                                // Look for Turnstile sitekey pattern (0x followed by hex)
-                                const m = text.match(/['"]?(0x4AAA[a-zA-Z0-9_-]+)['"]?/);
-                                if (m) return m[1];
-                                // Broader pattern
-                                const m2 = text.match(/sitekey['"]?\\s*[:=]\\s*['"]?(0x[a-fA-F0-9]+)/);
-                                if (m2) return m2[1];
-                                // Look for turnstile render call
-                                const m3 = text.match(/turnstile.*?['"]?(0x[a-fA-F0-9]{8,})['"]?/);
-                                if (m3) return m3[1];
-                            } catch(e) {}
-                        }
-
-                        // Check environment/config objects
-                        if (window.__env && window.__env.turnstileSitekey) return window.__env.turnstileSitekey;
-                        if (window.__config && window.__config.turnstileSitekey) return window.__config.turnstileSitekey;
-
-                        return null;
-                    }
-                """)
+                sitekey = os.environ.get("VFS_TURNSTILE_SITEKEY", "")
                 if sitekey:
-                    logger.info("Sitekey found in Angular bundle: %s...", sitekey[:16])
-
-            # Phase 3: Manually fetch + eval api.js if turnstile still undefined
-            if not sitekey:
-                logger.info("Phase 3: Manually fetching and evaluating api.js...")
-                eval_result = await page.evaluate("""
-                    async () => {
-                        try {
-                            const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/api.js');
-                            const status = resp.status;
-                            const text = await resp.text();
-                            const size = text.length;
-
-                            // Check if the response looks like JavaScript
-                            const isJS = text.trimStart().startsWith('(') ||
-                                         text.trimStart().startsWith('/') ||
-                                         text.trimStart().startsWith('!') ||
-                                         text.trimStart().startsWith('var') ||
-                                         text.trimStart().startsWith('window');
-
-                            if (status === 200 && isJS && size > 100) {
-                                // Eval the script to create window.turnstile
-                                eval(text);
-                                return {
-                                    status: status,
-                                    size: size,
-                                    turnstileAfterEval: typeof window.turnstile,
-                                    start: text.substring(0, 100)
-                                };
-                            }
-                            return {
-                                status: status,
-                                size: size,
-                                isJS: isJS,
-                                start: text.substring(0, 200)
-                            };
-                        } catch(e) {
-                            return {error: e.message};
-                        }
-                    }
-                """)
-                logger.info("Manual api.js fetch result: %s", eval_result)
-
-                # If eval worked, check for turnstile and try to get sitekey
-                if eval_result and eval_result.get("turnstileAfterEval") == "object":
-                    logger.info("Turnstile initialized via manual eval! Waiting for render...")
-                    # Wait for VFS to call render (now that turnstile exists)
-                    for post_wait in range(10):
-                        sitekey = await page.evaluate("""
-                            () => window.__capturedTurnstileSitekey
-                        """)
-                        if sitekey:
-                            logger.info("Sitekey captured after manual eval: %s...", sitekey[:16])
-                            break
-                        if captured_turnstile_sitekey.get("key"):
-                            sitekey = captured_turnstile_sitekey["key"]
-                            break
-                        await page.wait_for_timeout(3000)
-
-            # Phase 4: Last resort — look for sitekey in page HTML source
-            if not sitekey:
-                logger.info("Phase 4: Searching full page HTML for sitekey...")
-                sitekey = await page.evaluate("""
-                    () => {
-                        const html = document.documentElement.outerHTML;
-                        // Look for any 0x-prefixed hex string that looks like a sitekey
-                        const m = html.match(/0x4AAA[a-zA-Z0-9_-]{20,}/);
-                        if (m) return m[0];
-                        const m2 = html.match(/0x[0-9a-fA-F]{22,}/);
-                        if (m2) return m2[0];
-                        return null;
-                    }
-                """)
-                if sitekey:
-                    logger.info("Sitekey found in page HTML: %s...", sitekey[:16])
+                    logger.info("Using sitekey from env var: %s", sitekey)
 
             if not sitekey:
-                logger.warning("All 4 phases failed — no Turnstile sitekey found")
+                logger.warning("No Turnstile sitekey found from any source")
 
             if sitekey:
                 try:
@@ -859,28 +753,58 @@ async def _do_login() -> dict:
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
-                    # Inject token via the hooked callback (enables the button)
-                    await page.evaluate("""
+                    # Inject token — must trigger the Angular form callback
+                    inject_result = await page.evaluate("""
                         (token) => {
-                            // Method 1: Call the captured callback
+                            const results = [];
+
+                            // Method 1: Call the captured callback from our hook
                             if (window.__turnstileCallback) {
-                                window.__turnstileCallback(token);
+                                try {
+                                    window.__turnstileCallback(token);
+                                    results.push('callback_called');
+                                } catch(e) { results.push('callback_error:' + e.message); }
                             }
-                            // Method 2: Set hidden input values
-                            const inputs = [
-                                document.querySelector('[name="cf-turnstile-response"]'),
-                                document.querySelector('[name="g-recaptcha-response"]'),
-                            ];
-                            for (const input of inputs) {
-                                if (input) input.value = token;
+
+                            // Method 2: Set hidden input values + dispatch events
+                            const names = ['cf-turnstile-response', 'g-recaptcha-response'];
+                            for (const name of names) {
+                                const input = document.querySelector('[name="' + name + '"]');
+                                if (input) {
+                                    input.value = token;
+                                    input.dispatchEvent(new Event('input', {bubbles: true}));
+                                    input.dispatchEvent(new Event('change', {bubbles: true}));
+                                    results.push('input_set:' + name);
+                                }
                             }
-                            // Method 3: Try turnstile global callbacks
-                            if (window.turnstile && window.__turnstileWidgetId !== null) {
-                                // Some implementations check getResponse
+
+                            // Method 3: Find Turnstile container and trigger callback
+                            const containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
+                            for (const c of containers) {
+                                const cbName = c.getAttribute('data-callback');
+                                if (cbName && typeof window[cbName] === 'function') {
+                                    window[cbName](token);
+                                    results.push('data_callback:' + cbName);
+                                }
                             }
+
+                            // Method 4: Search for Angular reactive form integration
+                            // VFS uses ngModel or formControl — look for hidden textarea
+                            const textareas = document.querySelectorAll('textarea[name*="turnstile"], textarea[name*="captcha"]');
+                            for (const ta of textareas) {
+                                ta.value = token;
+                                ta.dispatchEvent(new Event('input', {bubbles: true}));
+                                results.push('textarea_set');
+                            }
+
+                            // Method 5: Dispatch custom event (some Angular integrations listen for this)
+                            window.dispatchEvent(new CustomEvent('turnstile-callback', {detail: {token}}));
+                            results.push('custom_event');
+
+                            return results;
                         }
                     """, token)
-                    logger.info("Turnstile token injected")
+                    logger.info("Turnstile token injection results: %s", inject_result)
                     await page.wait_for_timeout(3000)
                 except Exception as e:
                     logger.warning("CapSolver Turnstile solve failed: %s", e)
