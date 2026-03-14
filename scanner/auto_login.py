@@ -907,6 +907,99 @@ async def _do_login() -> dict:
 
         page.on("console", on_console)
 
+        # ── ROUTE INTERCEPT: Replace Turnstile api.js with our fake ──
+        # CRITICAL: addInitScript runs in Patchright's ISOLATED WORLD,
+        # not the page's main world. window.turnstile set there is invisible
+        # to Angular. Instead, we intercept the api.js script request and
+        # return our own script. This runs in the MAIN WORLD as a regular
+        # <script> tag, so Angular sees window.turnstile immediately.
+        async def intercept_turnstile_api(route):
+            """Replace Cloudflare Turnstile api.js with our fake."""
+            logger.info("[route] Intercepting Turnstile api.js — returning fake")
+            fake_script = """
+            (function() {
+                // Fake Turnstile API — runs in MAIN WORLD via <script> tag
+                window.__captchaToken = window.__captchaToken || null;
+                window.__turnstileCallback = null;
+                window.__allTurnstileCallbacks = [];
+                window.__capturedTurnstileSitekey = null;
+
+                window.turnstile = {
+                    render: function(container, options) {
+                        console.log('FAKE_TS_RENDER container=' +
+                            (typeof container === 'string' ? container : 'element'));
+                        if (options) {
+                            if (options.sitekey) {
+                                window.__capturedTurnstileSitekey = options.sitekey;
+                                console.log('FAKE_TS_SITEKEY:' + options.sitekey);
+                            }
+                            if (typeof options.callback === 'function') {
+                                window.__turnstileCallback = options.callback;
+                                window.__allTurnstileCallbacks.push(options.callback);
+                                console.log('FAKE_TS_CB_CAPTURED total=' +
+                                    window.__allTurnstileCallbacks.length);
+                                // If token already solved, invoke immediately
+                                if (window.__captchaToken) {
+                                    try {
+                                        options.callback(window.__captchaToken);
+                                        console.log('FAKE_TS_CB_INVOKED_IMMEDIATE');
+                                    } catch(e) {
+                                        console.log('FAKE_TS_CB_ERR:' + e.message);
+                                    }
+                                }
+                            }
+                            // Suppress error callback
+                            if (options['error-callback']) {
+                                options['error-callback'] = function() {};
+                            }
+                            if (options['expired-callback']) {
+                                options['expired-callback'] = function() {};
+                            }
+                        }
+                        // Also set the hidden input if it exists
+                        var cfInput = document.querySelector(
+                            'input[name="cf-turnstile-response"]');
+                        if (cfInput && window.__captchaToken) {
+                            cfInput.value = window.__captchaToken;
+                        }
+                        return 'fake_widget_0';
+                    },
+                    execute: function(container, options) {
+                        console.log('FAKE_TS_EXECUTE');
+                        if (options && typeof options.callback === 'function') {
+                            window.__turnstileCallback = options.callback;
+                            window.__allTurnstileCallbacks.push(options.callback);
+                            if (window.__captchaToken) {
+                                options.callback(window.__captchaToken);
+                            }
+                        }
+                        return window.__captchaToken || '';
+                    },
+                    getResponse: function() {
+                        return window.__captchaToken || '';
+                    },
+                    reset: function() { console.log('FAKE_TS_RESET'); },
+                    remove: function() {},
+                    isExpired: function() { return false; },
+                    ready: function(cb) {
+                        console.log('FAKE_TS_READY');
+                        if (typeof cb === 'function') cb();
+                    }
+                };
+                console.log('FAKE_API_JS_LOADED ts=' + typeof window.turnstile);
+            })();
+            """
+            await route.fulfill(
+                status=200,
+                content_type="application/javascript; charset=UTF-8",
+                body=fake_script,
+            )
+
+        # Catch both the initial URL and the versioned redirect URL
+        await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", intercept_turnstile_api)
+        await page.route("**/challenges.cloudflare.com/turnstile/v0/*/api.js*", intercept_turnstile_api)
+        logger.info("Turnstile api.js route interceptor set up")
+
         try:
             # Navigate to login page
             logger.info("Navigating to VFS login page...")
