@@ -168,8 +168,9 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
                 except Exception:
                     pass
 
-    # Only route these domains through the upstream proxy; everything else goes direct
-    PROXY_DOMAINS = ("vfsglobal.com",)
+    # Only route these specific hosts through the upstream proxy
+    # liftassets.vfsglobal.com is just a CDN — no geo-restriction
+    PROXY_DOMAINS = ("visa.vfsglobal.com", "lift-api.vfsglobal.com")
 
     def _handle(client):
         try:
@@ -191,7 +192,7 @@ def _start_auth_proxy(upstream_host, upstream_port, username, password):
             target_host = target.split(":")[0]
             target_port = int(target.split(":")[1]) if ":" in target else 443
 
-            use_proxy = any(d in target_host for d in PROXY_DOMAINS)
+            use_proxy = target_host in PROXY_DOMAINS
 
             if use_proxy and buf.startswith(b"CONNECT"):
                 logger.info("[local-proxy] PROXY %s", target)
