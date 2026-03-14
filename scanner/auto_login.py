@@ -405,27 +405,23 @@ async def _do_login() -> dict:
             // Platform
             Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
 
-            // FAKE TURNSTILE: Cloudflare's api.js never creates window.turnstile
-            // in headless (bot detection). So we create a fake one BEFORE the page
-            // loads. When Angular's component calls turnstile.render(), we capture
-            // the callback. Later, we call it with our CapSolver-solved token.
-            // This is NOT Object.defineProperty — just a plain assignment that
-            // Angular will find and use.
+            // IMMUTABLE FAKE TURNSTILE: Cloudflare's api.js actively removes
+            // window.turnstile in headless. Using Object.defineProperty with
+            // configurable:false makes it impossible for CF to delete/overwrite.
+            // NOTE: This is NOT the old getter/setter approach that broke things.
+            // We're setting a REAL object, just making the property immutable.
             window.__capturedTurnstileSitekey = null;
             window.__turnstileCallback = null;
             window.__turnstileWidgetId = null;
             window.__allTurnstileCallbacks = [];
-            window.turnstile = {
+
+            const _fakeTurnstile = {
                 render: function(container, options) {
                     console.log('FAKE_TURNSTILE_RENDER called with container=' +
                                 (typeof container === 'string' ? container : container?.id || 'element'));
                     if (options) {
-                        console.log('FAKE_TURNSTILE_RENDER options: ' + JSON.stringify({
-                            sitekey: options.sitekey,
-                            callback: typeof options.callback,
-                            action: options.action,
-                            theme: options.theme
-                        }));
+                        console.log('FAKE_TURNSTILE_RENDER options keys: ' +
+                                    Object.keys(options).join(','));
                         if (options.sitekey) {
                             window.__capturedTurnstileSitekey = options.sitekey;
                             console.log('TURNSTILE_SITEKEY_CAPTURED:' + options.sitekey);
@@ -433,7 +429,15 @@ async def _do_login() -> dict:
                         if (options.callback) {
                             window.__turnstileCallback = options.callback;
                             window.__allTurnstileCallbacks.push(options.callback);
-                            console.log('TURNSTILE_CALLBACK_CAPTURED');
+                            console.log('TURNSTILE_CALLBACK_CAPTURED (type=' +
+                                        typeof options.callback + ')');
+                        }
+                        // VFS may pass 'error-callback' or 'expired-callback'
+                        if (options['error-callback']) {
+                            console.log('TURNSTILE has error-callback');
+                        }
+                        if (options['expired-callback']) {
+                            console.log('TURNSTILE has expired-callback');
                         }
                     }
                     window.__turnstileWidgetId = 'fake-widget-0';
@@ -445,34 +449,48 @@ async def _do_login() -> dict:
                 isExpired: function(id) { return false; },
                 execute: function(container, options) {
                     console.log('FAKE_TURNSTILE_EXECUTE called');
-                    // Some implementations use execute instead of render
                     if (options && options.callback) {
                         window.__turnstileCallback = options.callback;
                         window.__allTurnstileCallbacks.push(options.callback);
+                        console.log('TURNSTILE_CALLBACK_CAPTURED via execute');
                     }
                     return 'fake-widget-0';
-                }
+                },
+                ready: function(cb) {
+                    // Some implementations call turnstile.ready(callback)
+                    console.log('FAKE_TURNSTILE_READY called');
+                    if (typeof cb === 'function') cb();
+                },
+                __isFake: true
             };
-            console.log('FAKE_TURNSTILE installed on window.turnstile');
 
-            // Protect against Cloudflare api.js overwriting our fake.
-            // Re-check every second and re-install if needed.
-            const _fakeTurnstile = window.turnstile;
-            const _protectInterval = setInterval(() => {
-                if (!window.turnstile || !window.turnstile.__isFake) {
-                    // Cloudflare overwrote or deleted our fake — reinstall
-                    // but keep the callback if we captured one
-                    const savedCb = window.__turnstileCallback;
-                    const savedCbs = window.__allTurnstileCallbacks || [];
-                    window.turnstile = _fakeTurnstile;
-                    window.__turnstileCallback = savedCb;
-                    window.__allTurnstileCallbacks = savedCbs;
-                    console.log('FAKE_TURNSTILE re-installed (was overwritten)');
+            // Lock it down — Cloudflare can't delete or overwrite
+            Object.defineProperty(window, 'turnstile', {
+                value: _fakeTurnstile,
+                writable: false,
+                configurable: false,
+                enumerable: true
+            });
+            console.log('FAKE_TURNSTILE installed (immutable via defineProperty)');
+
+            // Also watch for Angular's Turnstile component loading via script tag
+            // Some Angular wrappers listen for the script's onload event
+            const observer = new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                    for (const node of m.addedNodes) {
+                        if (node.tagName === 'SCRIPT' && node.src &&
+                            node.src.includes('challenges.cloudflare.com')) {
+                            console.log('TURNSTILE_SCRIPT_ADDED: ' + node.src);
+                            // Fire load event so Angular wrappers think script loaded
+                            setTimeout(() => {
+                                node.dispatchEvent(new Event('load'));
+                                console.log('TURNSTILE_SCRIPT_LOAD_FIRED');
+                            }, 1000);
+                        }
+                    }
                 }
-            }, 500);
-            window.turnstile.__isFake = true;
-            // Stop protection after 60s (by then Angular has already called render)
-            setTimeout(() => clearInterval(_protectInterval), 60000);
+            });
+            observer.observe(document.documentElement, {childList: true, subtree: true});
         }
         """)
 
@@ -529,6 +547,9 @@ async def _do_login() -> dict:
             if msg.type in ("error", "warning"):
                 logger.info("[console.%s] %s", msg.type, text)
                 js_errors.append(text)
+            # Log ALL our fake turnstile messages
+            if text.startswith("FAKE_TURNSTILE") or text.startswith("TURNSTILE_"):
+                logger.info("[console] %s", text)
             # Capture sitekey from our hook
             if "TURNSTILE_SITEKEY_CAPTURED:" in text:
                 key = text.split("TURNSTILE_SITEKEY_CAPTURED:")[1].strip()
