@@ -398,6 +398,32 @@ async def _do_login() -> dict:
             Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
             // Platform
             Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
+
+            // Hook Turnstile to capture sitekey and callback
+            window.__capturedTurnstileSitekey = null;
+            window.__turnstileCallback = null;
+            window.__turnstileWidgetId = null;
+            let _turnstileObj = null;
+            Object.defineProperty(window, 'turnstile', {
+                set: function(val) {
+                    _turnstileObj = val;
+                    if (val && val.render) {
+                        const origRender = val.render;
+                        val.render = function(container, options) {
+                            if (options && options.sitekey) {
+                                window.__capturedTurnstileSitekey = options.sitekey;
+                                window.__turnstileCallback = options.callback;
+                                console.log('TURNSTILE_SITEKEY_CAPTURED:' + options.sitekey);
+                            }
+                            const widgetId = origRender.apply(this, arguments);
+                            window.__turnstileWidgetId = widgetId;
+                            return widgetId;
+                        };
+                    }
+                },
+                get: function() { return _turnstileObj; },
+                configurable: true,
+            });
         }
         """)
 
@@ -531,17 +557,7 @@ async def _do_login() -> dict:
                 except Exception:
                     continue
 
-            # Solve Turnstile
-            try:
-                sitekey = await _extract_turnstile_sitekey(page)
-                token = solve_turnstile(VFS_LOGIN_URL, sitekey)
-                await _inject_turnstile_token(page, token)
-                await page.wait_for_timeout(2000)
-            except Exception as e:
-                logger.warning("Turnstile solving failed: %s — trying to proceed anyway", e)
-
-            # Fill credentials
-            # VFS uses Angular Material — inputs are #mat-input-0 (email), #mat-input-1 (password)
+            # Fill credentials first — Turnstile may render after form interaction
             logger.info("Filling login credentials...")
 
             # Try Angular Material selectors first, then generic fallbacks
@@ -634,16 +650,61 @@ async def _do_login() -> dict:
             # Pause after filling credentials — VFS Angular app needs time to process
             await page.wait_for_timeout(3000)
 
+            # Solve Turnstile CAPTCHA via CapSolver
+            # The init script hooks turnstile.render() to capture the sitekey.
+            # We also try the old DOM-based extraction as fallback.
+            logger.info("Solving Turnstile CAPTCHA...")
+            sitekey = await page.evaluate("window.__capturedTurnstileSitekey")
+            if sitekey:
+                logger.info("Turnstile sitekey captured via hook: %s...", sitekey[:12])
+            else:
+                # Fallback: try DOM-based extraction
+                try:
+                    sitekey = await _extract_turnstile_sitekey(page)
+                except Exception:
+                    sitekey = None
+
+            if sitekey:
+                try:
+                    logger.info("Requesting CapSolver to solve Turnstile...")
+                    token = solve_turnstile(VFS_LOGIN_URL, sitekey)
+                    logger.info("Turnstile solved! Token length: %d", len(token))
+
+                    # Inject token via the hooked callback (enables the button)
+                    await page.evaluate("""
+                        (token) => {
+                            // Method 1: Call the captured callback
+                            if (window.__turnstileCallback) {
+                                window.__turnstileCallback(token);
+                            }
+                            // Method 2: Set hidden input values
+                            const inputs = [
+                                document.querySelector('[name="cf-turnstile-response"]'),
+                                document.querySelector('[name="g-recaptcha-response"]'),
+                            ];
+                            for (const input of inputs) {
+                                if (input) input.value = token;
+                            }
+                            // Method 3: Try turnstile global callbacks
+                            if (window.turnstile && window.__turnstileWidgetId !== null) {
+                                // Some implementations check getResponse
+                            }
+                        }
+                    """, token)
+                    logger.info("Turnstile token injected")
+                    await page.wait_for_timeout(3000)
+                except Exception as e:
+                    logger.warning("CapSolver Turnstile solve failed: %s", e)
+            else:
+                logger.warning("No Turnstile sitekey found — button may stay disabled")
+
             # Click Sign In button
-            # The button starts disabled (waiting for Turnstile CAPTCHA to solve).
-            # Wait up to 60s for it to appear and become enabled.
             logger.info("Looking for Sign In button...")
             sign_in = page.locator('button[type="submit"]:has-text("Sign In")')
             try:
                 await sign_in.wait_for(state="attached", timeout=60000)
                 logger.info("Sign In button found in DOM")
             except Exception:
-                # Fallback: try broader selector
                 sign_in = page.locator('button:has-text("Sign In")')
                 try:
                     await sign_in.wait_for(state="attached", timeout=30000)
@@ -653,27 +714,30 @@ async def _do_login() -> dict:
                     await _log_page_debug(page, "submit-not-found")
                     raise RuntimeError("Could not find submit button")
 
-            # Wait for button to become enabled (Turnstile solving in background)
-            for wait_i in range(18):  # 18 × 5s = 90s max
-                is_disabled = await sign_in.is_disabled()
-                if not is_disabled:
-                    logger.info("Sign In button is enabled!")
-                    break
-                logger.info("Sign In button still disabled (%d/9)...", wait_i + 1)
-                await page.wait_for_timeout(5000)
-            else:
-                # Button stayed disabled after 90s — force-enable via JS
-                logger.warning("Sign In button still disabled after 90s — force-enabling")
-                await page.evaluate("""
-                    () => {
-                        const btn = document.querySelector('button[type="submit"]');
-                        if (btn) {
-                            btn.disabled = false;
-                            btn.classList.remove('mat-mdc-button-disabled');
+            # Check if button is enabled (Turnstile token should have enabled it)
+            is_disabled = await sign_in.is_disabled()
+            if is_disabled:
+                logger.info("Sign In button still disabled — waiting up to 30s...")
+                for wait_i in range(6):  # 6 × 5s = 30s
+                    await page.wait_for_timeout(5000)
+                    if not await sign_in.is_disabled():
+                        logger.info("Sign In button is now enabled!")
+                        break
+                    logger.info("Still disabled (%d/6)...", wait_i + 1)
+                else:
+                    logger.warning("Force-enabling Sign In button")
+                    await page.evaluate("""
+                        () => {
+                            const btn = document.querySelector('button[type="submit"]');
+                            if (btn) {
+                                btn.disabled = false;
+                                btn.classList.remove('mat-mdc-button-disabled');
+                            }
                         }
-                    }
-                """)
-                await page.wait_for_timeout(500)
+                    """)
+                    await page.wait_for_timeout(500)
+            else:
+                logger.info("Sign In button is enabled!")
 
             await sign_in.click(force=True)
             logger.info("Clicked Sign In button")
