@@ -427,24 +427,40 @@ async def _do_login() -> dict:
         }
         """)
 
-        # Intercept API requests to capture auth headers
+        # Intercept requests to capture auth headers and Turnstile sitekey
+        captured_turnstile_sitekey = {}
+
         async def on_request(request):
-            if "lift-api.vfsglobal.com" in request.url:
+            url = request.url
+            if "lift-api.vfsglobal.com" in url:
                 headers = request.headers
                 if headers.get("authorize") and not captured_headers.get("authorize"):
                     captured_headers["authorize"] = headers["authorize"]
                     captured_headers["clientsource"] = headers.get("clientsource", "")
                     logger.info("Captured authorize token from API request")
+            # Capture Turnstile sitekey from challenge requests
+            if "challenges.cloudflare.com" in url and "sitekey=" in url:
+                import re
+                m = re.search(r"sitekey=([^&]+)", url)
+                if m and not captured_turnstile_sitekey.get("key"):
+                    captured_turnstile_sitekey["key"] = m.group(1)
+                    logger.info("Captured Turnstile sitekey from request URL: %s", m.group(1)[:12])
 
         page.on("request", on_request)
 
-        # Capture JS console errors
+        # Capture JS console messages (errors + Turnstile sitekey)
         js_errors = []
 
         def on_console(msg):
+            text = msg.text
             if msg.type in ("error", "warning"):
-                logger.info("[console.%s] %s", msg.type, msg.text)
-                js_errors.append(msg.text)
+                logger.info("[console.%s] %s", msg.type, text)
+                js_errors.append(text)
+            # Capture sitekey from our hook
+            if "TURNSTILE_SITEKEY_CAPTURED:" in text:
+                key = text.split("TURNSTILE_SITEKEY_CAPTURED:")[1].strip()
+                captured_turnstile_sitekey["key"] = key
+                logger.info("Captured Turnstile sitekey from console hook: %s...", key[:12])
 
         page.on("console", on_console)
 
@@ -651,18 +667,90 @@ async def _do_login() -> dict:
             await page.wait_for_timeout(3000)
 
             # Solve Turnstile CAPTCHA via CapSolver
-            # The init script hooks turnstile.render() to capture the sitekey.
-            # We also try the old DOM-based extraction as fallback.
+            # Try multiple methods to find the sitekey:
+            # 1. Init script hook (window.__capturedTurnstileSitekey)
+            # 2. Network request interception (challenges.cloudflare.com?sitekey=...)
+            # 3. cf-turnstile div with data-sitekey
+            # 4. Turnstile iframe src
+            # 5. Script content search
             logger.info("Solving Turnstile CAPTCHA...")
+
+            # Method 1: Init script hook
             sitekey = await page.evaluate("window.__capturedTurnstileSitekey")
             if sitekey:
-                logger.info("Turnstile sitekey captured via hook: %s...", sitekey[:12])
-            else:
-                # Fallback: try DOM-based extraction
-                try:
-                    sitekey = await _extract_turnstile_sitekey(page)
-                except Exception:
-                    sitekey = None
+                logger.info("Turnstile sitekey via JS hook: %s...", sitekey[:12])
+
+            # Method 2: Network interception
+            if not sitekey and captured_turnstile_sitekey.get("key"):
+                sitekey = captured_turnstile_sitekey["key"]
+                logger.info("Turnstile sitekey via network capture: %s...", sitekey[:12])
+
+            # Method 3: cf-turnstile div
+            if not sitekey:
+                sitekey = await page.evaluate("""
+                    () => {
+                        const el = document.querySelector('.cf-turnstile, [data-sitekey]');
+                        return el ? el.getAttribute('data-sitekey') : null;
+                    }
+                """)
+                if sitekey:
+                    logger.info("Turnstile sitekey via DOM attribute: %s...", sitekey[:12])
+
+            # Method 4: Turnstile iframe src
+            if not sitekey:
+                sitekey = await page.evaluate("""
+                    () => {
+                        const iframes = document.querySelectorAll('iframe');
+                        for (const f of iframes) {
+                            const m = f.src && f.src.match(/sitekey=([^&]+)/);
+                            if (m) return m[1];
+                        }
+                        return null;
+                    }
+                """)
+                if sitekey:
+                    logger.info("Turnstile sitekey via iframe: %s...", sitekey[:12])
+
+            # Method 5: Search all scripts for sitekey pattern
+            if not sitekey:
+                sitekey = await page.evaluate("""
+                    () => {
+                        const scripts = document.querySelectorAll('script');
+                        for (const s of scripts) {
+                            const t = s.textContent || s.innerText || '';
+                            // Look for sitekey in various formats
+                            const patterns = [
+                                /sitekey['"]?\\s*[:=]\\s*['"]?(0x[a-fA-F0-9]+)/,
+                                /data-sitekey=['"]([^'"]+)/,
+                                /turnstile.*?['"]([0-9a-zA-Z_-]{20,})/,
+                                /recaptcha.*?sitekey.*?['"]([^'"]+)/,
+                            ];
+                            for (const p of patterns) {
+                                const m = t.match(p);
+                                if (m) return m[1];
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if sitekey:
+                    logger.info("Turnstile sitekey via script search: %s...", sitekey[:12])
+
+            # Debug: log what we found
+            if not sitekey:
+                debug_info = await page.evaluate("""
+                    () => ({
+                        turnstileExists: typeof window.turnstile !== 'undefined',
+                        turnstileType: typeof window.turnstile,
+                        cfTurnstileDivs: document.querySelectorAll('.cf-turnstile').length,
+                        dataSitekeyEls: document.querySelectorAll('[data-sitekey]').length,
+                        iframeCount: document.querySelectorAll('iframe').length,
+                        iframeSrcs: Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(s => s),
+                        voltRecaptcha: document.getElementById('volt-recaptcha') ?
+                            document.getElementById('volt-recaptcha').src || document.getElementById('volt-recaptcha').textContent.substring(0, 200) : null,
+                    })
+                """)
+                logger.warning("No Turnstile sitekey found! Debug: %s", debug_info)
 
             if sitekey:
                 try:
