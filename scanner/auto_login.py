@@ -385,44 +385,104 @@ async def _do_login() -> dict:
 
         page.on("request", on_request)
 
+        # Capture JS console errors
+        js_errors = []
+
+        def on_console(msg):
+            if msg.type in ("error", "warning"):
+                logger.info("[console.%s] %s", msg.type, msg.text)
+                js_errors.append(msg.text)
+
+        page.on("console", on_console)
+
         try:
             # Navigate to login page
             logger.info("Navigating to VFS login page...")
             await page.goto(VFS_LOGIN_URL, wait_until="load", timeout=60000)
 
-            # Wait for Cloudflare JS challenge to resolve + Angular to bootstrap
-            # The page may be empty initially while CF verifies the browser
-            logger.info("Waiting for page to fully load (CF challenge + Angular)...")
-            for attempt_wait in range(6):  # Up to 60s total (6 x 10s)
+            # Check if VFS blocked us (redirects to page-not-found)
+            if "page-not-found" in page.url:
+                await _log_page_debug(page, "blocked")
+                raise RuntimeError(
+                    "VFS blocked the request (page-not-found). "
+                    "IP may be rate-limited — will retry with backoff."
+                )
+
+            # Step 1: Handle Cloudflare Turnstile challenge
+            # The Turnstile checkbox must be clicked before Angular bootstraps
+            logger.info("Looking for Cloudflare Turnstile challenge...")
+            for cf_attempt in range(3):
+                try:
+                    # Look for Turnstile iframe
+                    cf_frame = page.frame_locator(
+                        "iframe[src*='challenges.cloudflare.com'], "
+                        "iframe[src*='turnstile']"
+                    )
+                    # Try to click the checkbox inside the iframe
+                    checkbox = cf_frame.locator(
+                        "input[type='checkbox'], "
+                        ".cb-lb, "
+                        "#challenge-stage, "
+                        "label"
+                    )
+                    if await checkbox.count() > 0:
+                        logger.info("Found Turnstile checkbox — clicking...")
+                        await checkbox.first.click(timeout=5000)
+                        logger.info("Clicked Turnstile checkbox")
+                        await page.wait_for_timeout(5000)
+                        break
+                    else:
+                        logger.info("No Turnstile checkbox found (attempt %d/3)", cf_attempt + 1)
+                except Exception as e:
+                    logger.info("Turnstile check %d/3: %s", cf_attempt + 1, e)
+                await page.wait_for_timeout(3000)
+
+            # Also try clicking any visible Turnstile widget in the main page
+            try:
+                turnstile_div = page.locator("[data-sitekey], .cf-turnstile, #cf-turnstile")
+                if await turnstile_div.count() > 0:
+                    logger.info("Found Turnstile widget — clicking...")
+                    await turnstile_div.first.click()
+                    await page.wait_for_timeout(5000)
+            except Exception:
+                pass
+
+            # Step 2: Wait for Angular to bootstrap
+            logger.info("Waiting for Angular to bootstrap...")
+            for attempt_wait in range(12):  # Up to 120s total (12 x 10s)
                 try:
                     await page.wait_for_selector(
-                        "#mat-input-0, input[type='email'], app-login, mat-form-field",
+                        "#mat-input-0, input[type='email'], app-login input, mat-form-field",
                         timeout=10000,
                     )
-                    logger.info("Login form detected")
+                    logger.info("Login form detected!")
                     break
                 except Exception:
                     title = await page.title()
                     url = page.url
-                    logger.info("Wait %d/6 — no form yet. URL: %s | Title: %s", attempt_wait + 1, url, title)
+                    logger.info("Wait %d/12 — no form yet. URL: %s | Title: %s", attempt_wait + 1, url, title)
                     if "page-not-found" in url:
-                        break  # Will be caught by the check below
+                        break
+
+                    # Every 30s, try clicking Turnstile again
+                    if (attempt_wait + 1) % 3 == 0:
+                        try:
+                            cf_frame = page.frame_locator("iframe[src*='challenges.cloudflare.com']")
+                            checkbox = cf_frame.locator("input[type='checkbox'], .cb-lb, label")
+                            if await checkbox.count() > 0:
+                                await checkbox.first.click(timeout=3000)
+                                logger.info("Re-clicked Turnstile checkbox")
+                                await page.wait_for_timeout(5000)
+                        except Exception:
+                            pass
             else:
-                logger.warning("Login form not found after 60s")
+                logger.warning("Login form not found after 120s")
                 await _log_page_debug(page, "form-not-found")
 
-            # Debug: log page state after load
+            # Debug: log page state
             page_title = await page.title()
             logger.info("Page loaded — URL: %s | Title: %s", page.url, page_title)
 
-            # Check if we're on a Cloudflare challenge page
-            if "just a moment" in page_title.lower() or "cloudflare" in page_title.lower():
-                logger.warning("Cloudflare challenge page detected — waiting longer...")
-                await page.wait_for_timeout(10000)
-                page_title = await page.title()
-                logger.info("After wait — URL: %s | Title: %s", page.url, page_title)
-
-            # Check if VFS blocked us (redirects to page-not-found)
             if "page-not-found" in page.url or "unable to progress" in page_title.lower():
                 await _log_page_debug(page, "blocked")
                 raise RuntimeError(
