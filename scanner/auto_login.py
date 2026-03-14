@@ -516,23 +516,91 @@ async def _do_login() -> dict:
                 // Getter/setter trap:
                 // - getter returns real turnstile if set, otherwise returns fake
                 // - setter wraps real turnstile when api.js sets it
+                // - configurable: false → CANNOT be deleted by api.js cleanup
+                // - Object.defineProperty override → silently handles redefinition attempts
                 var _realTs = undefined;
+
+                // Override Object.defineProperty to intercept turnstile redefinition
+                var _origDefProp = Object.defineProperty;
+                Object.defineProperty = function(obj, prop, desc) {
+                    if (obj === window && prop === 'turnstile') {
+                        console.log('ODP_TURNSTILE type=' +
+                            (desc ? (desc.value ? typeof desc.value : 'accessor') : 'none'));
+                        // Pass value through our setter if present
+                        if (desc && 'value' in desc) {
+                            if (desc.value && typeof desc.value === 'object') {
+                                _realTs = desc.value;
+                                _wrapTurnstile(desc.value);
+                                console.log('ODP_TURNSTILE_STORED');
+                            }
+                        }
+                        return obj; // silently succeed without redefining
+                    }
+                    return _origDefProp.apply(this, arguments);
+                };
+
                 try {
-                    Object.defineProperty(window, 'turnstile', {
+                    _origDefProp.call(Object, window, 'turnstile', {
                         get: function() { return _realTs || _fakeTs; },
                         set: function(v) {
                             console.log('TS_SET type=' + typeof v);
                             _realTs = v;
                             if (v && typeof v === 'object') _wrapTurnstile(v);
                         },
-                        configurable: true,
+                        configurable: false,
                         enumerable: true
                     });
-                    console.log('INIT_TS_TRAP_OK (fake ready)');
+                    console.log('INIT_TS_TRAP_OK (non-configurable)');
                 } catch(e) { console.log('INIT_TS_TRAP_FAIL:'+e.message); }
 
                 console.log('INIT_CAPTCHA_OK ts_type=' + typeof window.turnstile);
             } catch(e) { console.log('INIT_CAPTCHA_FAIL:'+e.message); }
+
+            // ── XHR INTERCEPTOR ──
+            // Belt-and-suspenders: intercept login POST at XMLHttpRequest level
+            // and inject captcha token. Works even if Angular's form validation
+            // passed with empty captcha (route interceptor is Playwright-level,
+            // this is JavaScript-level).
+            try {
+                var _origXhrOpen = XMLHttpRequest.prototype.open;
+                var _origXhrSend = XMLHttpRequest.prototype.send;
+
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__method = method;
+                    this.__url = url;
+                    return _origXhrOpen.apply(this, arguments);
+                };
+
+                XMLHttpRequest.prototype.send = function(body) {
+                    if (this.__method === 'POST' && this.__url &&
+                        this.__url.indexOf('lift-api.vfsglobal.com') >= 0 &&
+                        body && typeof body === 'string') {
+                        try {
+                            var json = JSON.parse(body);
+                            if (json.username || json.password) {
+                                console.log('XHR_LOGIN keys=' + Object.keys(json).join(','));
+                                var modified = false;
+                                if (window.__captchaToken) {
+                                    if (!json.captcha_api_key || json.captcha_api_key === '') {
+                                        json.captcha_api_key = window.__captchaToken;
+                                        modified = true;
+                                    }
+                                    if (!json.captcha_version) {
+                                        json.captcha_version = 'Turnstile';
+                                        modified = true;
+                                    }
+                                }
+                                if (modified) {
+                                    body = JSON.stringify(json);
+                                    console.log('XHR_CAPTCHA_INJECTED');
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    return _origXhrSend.call(this, body);
+                };
+                console.log('INIT_XHR_INTERCEPT_OK');
+            } catch(e) { console.log('INIT_XHR_INTERCEPT_FAIL:' + e.message); }
 
             // ── SCRIPT LOAD INTERCEPTION ──
             // Angular waits for <script id="volt-recaptcha"> 'load' event before
@@ -684,6 +752,11 @@ async def _do_login() -> dict:
             if text.startswith("SCRIPT_LOADED:") or text.startswith("LATE_LOAD_"):
                 logger.info("[console] %s", text)
             if text.startswith("RENDER_RETRY"):
+                logger.info("[console] %s", text)
+            # Log Object.defineProperty intercept + XHR intercept
+            if text.startswith("ODP_") or text.startswith("XHR_"):
+                logger.info("[console] %s", text)
+            if text.startswith("FG_PATCHED") or text.startswith("REINSTALLED_"):
                 logger.info("[console] %s", text)
             # Capture sitekey from Turnstile wrapper or fake render
             if "TS_SITEKEY:" in text:
@@ -1027,12 +1100,47 @@ async def _do_login() -> dict:
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
+                    # ── SAFETY: Reinstall turnstile fake if trap was lost ──
+                    ts_health = await page.evaluate("""
+                        () => {
+                            var r = { ts_type: typeof window.turnstile };
+                            if (typeof window.turnstile === 'undefined') {
+                                // Trap was lost — reinstall a simple fake directly
+                                try {
+                                    window.turnstile = {
+                                        render: function(c, opts) {
+                                            console.log('REINSTALLED_TS_RENDER');
+                                            if (opts && typeof opts.callback === 'function') {
+                                                window.__turnstileCallback = opts.callback;
+                                                window.__allTurnstileCallbacks =
+                                                    window.__allTurnstileCallbacks || [];
+                                                window.__allTurnstileCallbacks.push(opts.callback);
+                                                if (window.__captchaToken) opts.callback(window.__captchaToken);
+                                            }
+                                            return 'w0';
+                                        },
+                                        getResponse: function() { return window.__captchaToken || ''; },
+                                        ready: function(cb) { if (typeof cb === 'function') cb(); },
+                                        reset: function() {},
+                                        remove: function() {},
+                                        isExpired: function() { return false; },
+                                        __wrapped: true
+                                    };
+                                    r.reinstalled = true;
+                                    r.ts_type_after = typeof window.turnstile;
+                                } catch(e) {
+                                    r.reinstall_err = e.message;
+                                }
+                            }
+                            // Ensure globals exist
+                            if (!window.__allTurnstileCallbacks) window.__allTurnstileCallbacks = [];
+                            if (!window.__captchaToken) window.__captchaToken = null;
+                            return r;
+                        }
+                    """)
+                    logger.info("Turnstile health check: %s", ts_health)
+
                     # ── SET TOKEN + INVOKE CAPTURED CALLBACK ──
-                    # The init script's fake turnstile is always present via the
-                    # getter (returns _fakeTs when _realTs is undefined). Angular
-                    # should have already found it and called render() during
-                    # bootstrap, capturing the callback in __turnstileCallback.
-                    # Now we set the token and invoke the callback.
                     inject_result = await page.evaluate("""
                         (token) => {
                             const r = {};
@@ -1330,37 +1438,58 @@ async def _do_login() -> dict:
                     logger.info("Still disabled (%d/2)...", wait_i + 1)
                 else:
                     logger.warning("Force-enabling Sign In button + form submission")
-                    await page.evaluate("""
+                    # Synchronous: force-enable + click in ONE JS execution
+                    # so Angular can't re-disable between enable and click
+                    click_result = await page.evaluate("""
                         () => {
+                            var r = {};
                             // Force-enable ALL buttons containing "Sign In"
-                            const allBtns = document.querySelectorAll('button');
-                            for (const btn of allBtns) {
-                                if ((btn.textContent || '').includes('Sign In')) {
+                            var allBtns = document.querySelectorAll('button');
+                            for (var i = 0; i < allBtns.length; i++) {
+                                var btn = allBtns[i];
+                                if ((btn.textContent || '').indexOf('Sign In') >= 0) {
                                     btn.disabled = false;
                                     btn.classList.remove('mat-mdc-button-disabled');
                                     btn.removeAttribute('disabled');
+                                    r.enabled = true;
                                 }
                             }
-                            // Also try type=submit as fallback
-                            const submitBtn = document.querySelector('button[type="submit"]');
+                            // Also try type=submit
+                            var submitBtn = document.querySelector('button[type="submit"]');
                             if (submitBtn) {
                                 submitBtn.disabled = false;
                                 submitBtn.classList.remove('mat-mdc-button-disabled');
                                 submitBtn.removeAttribute('disabled');
                             }
                             // Set forms to noValidate
-                            const forms = document.querySelectorAll('form');
-                            for (const f of forms) {
-                                f.noValidate = true;
+                            var forms = document.querySelectorAll('form');
+                            for (var f of forms) f.noValidate = true;
+                            // SYNCHRONOUS CLICK — Angular cannot re-disable in between
+                            for (var j = 0; j < allBtns.length; j++) {
+                                if ((allBtns[j].textContent || '').indexOf('Sign In') >= 0) {
+                                    allBtns[j].click();
+                                    r.clicked = true;
+                                    break;
+                                }
                             }
+                            // Also dispatch submit on the form
+                            if (forms.length > 0) {
+                                forms[0].dispatchEvent(new Event('submit', {bubbles: true}));
+                                r.submit_dispatched = true;
+                            }
+                            return r;
                         }
                     """)
-                    await page.wait_for_timeout(500)
+                    logger.info("Synchronous force-click result: %s", click_result)
             else:
                 logger.info("Sign In button is enabled!")
 
-            await sign_in.click(force=True)
-            logger.info("Clicked Sign In button")
+            # Also click via Playwright for good measure
+            try:
+                await sign_in.click(force=True)
+                logger.info("Clicked Sign In button (Playwright)")
+            except Exception as e:
+                logger.info("Playwright click: %s", e)
 
             # ── POST-CLICK: Wait for navigation ──
             # After clicking Sign In, Angular may call turnstile.render() which
