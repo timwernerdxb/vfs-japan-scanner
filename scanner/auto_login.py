@@ -513,45 +513,33 @@ async def _do_login() -> dict:
                     console.log('TS_REAL_WRAPPED_OK');
                 }
 
-                // Getter/setter trap:
-                // - getter returns real turnstile if set, otherwise returns fake
-                // - setter wraps real turnstile when api.js sets it
-                // - configurable: false → CANNOT be deleted by api.js cleanup
-                // - Object.defineProperty override → silently handles redefinition attempts
-                var _realTs = undefined;
-
-                // Override Object.defineProperty to intercept turnstile redefinition
+                // DIRECT ASSIGNMENT + POLLING
+                // NOTE: Object.defineProperty getter/setter trap does NOT work
+                // in Patchright's environment — the trap silently fails and
+                // window.turnstile stays 'undefined'. Instead, we:
+                // 1. Set window.turnstile = fake directly
+                // 2. Poll every 200ms to restore it if Cloudflare's api.js
+                //    deletes or overwrites it
+                // 3. If api.js sets the REAL turnstile, wrap it
                 var _origDefProp = Object.defineProperty;
-                Object.defineProperty = function(obj, prop, desc) {
-                    if (obj === window && prop === 'turnstile') {
-                        console.log('ODP_TURNSTILE type=' +
-                            (desc ? (desc.value ? typeof desc.value : 'accessor') : 'none'));
-                        // Pass value through our setter if present
-                        if (desc && 'value' in desc) {
-                            if (desc.value && typeof desc.value === 'object') {
-                                _realTs = desc.value;
-                                _wrapTurnstile(desc.value);
-                                console.log('ODP_TURNSTILE_STORED');
-                            }
-                        }
-                        return obj; // silently succeed without redefining
-                    }
-                    return _origDefProp.apply(this, arguments);
-                };
+                window.turnstile = _fakeTs;
+                console.log('INIT_TS_DIRECT ts_type=' + typeof window.turnstile);
 
-                try {
-                    _origDefProp.call(Object, window, 'turnstile', {
-                        get: function() { return _realTs || _fakeTs; },
-                        set: function(v) {
-                            console.log('TS_SET type=' + typeof v);
-                            _realTs = v;
-                            if (v && typeof v === 'object') _wrapTurnstile(v);
-                        },
-                        configurable: false,
-                        enumerable: true
-                    });
-                    console.log('INIT_TS_TRAP_OK (non-configurable)');
-                } catch(e) { console.log('INIT_TS_TRAP_FAIL:'+e.message); }
+                var _tsGuardInterval = setInterval(function() {
+                    if (typeof window.turnstile === 'undefined' ||
+                        window.turnstile === null) {
+                        // Cloudflare deleted it — restore fake
+                        window.turnstile = _fakeTs;
+                        console.log('TS_GUARD_RESTORED');
+                    } else if (window.turnstile !== _fakeTs &&
+                               !window.turnstile.__wrapped) {
+                        // api.js set the real turnstile — wrap it
+                        _wrapTurnstile(window.turnstile);
+                        console.log('TS_GUARD_WRAPPED');
+                    }
+                }, 200);
+                // Stop polling after 2 minutes
+                setTimeout(function() { clearInterval(_tsGuardInterval); }, 120000);
 
                 console.log('INIT_CAPTCHA_OK ts_type=' + typeof window.turnstile);
             } catch(e) { console.log('INIT_CAPTCHA_FAIL:'+e.message); }
@@ -892,13 +880,18 @@ async def _do_login() -> dict:
                 logger.info("[console] %s", text)
             if text.startswith("RENDER_RETRY"):
                 logger.info("[console] %s", text)
-            # Log Object.defineProperty intercept + XHR/fetch intercept
-            if text.startswith("ODP_") or text.startswith("XHR_") or text.startswith("FETCH_"):
+            # Log XHR/fetch intercept + direct assignment guard
+            if text.startswith("XHR_") or text.startswith("FETCH_"):
                 logger.info("[console] %s", text)
             if text.startswith("FG_PATCHED") or text.startswith("REINSTALLED_"):
                 logger.info("[console] %s", text)
             # Log onload interceptor events
             if text.startswith("ONLOAD_"):
+                logger.info("[console] %s", text)
+            # Log turnstile guard (direct assignment polling)
+            if text.startswith("TS_GUARD_") or text.startswith("CF_INPUT_"):
+                logger.info("[console] %s", text)
+            if text.startswith("SELF_RENDER"):
                 logger.info("[console] %s", text)
             # Capture sitekey from Turnstile wrapper or fake render
             if "TS_SITEKEY:" in text:
@@ -1410,10 +1403,10 @@ async def _do_login() -> dict:
                     logger.info("DOM diagnostic — iframes: %s", dom_diag.get("iframes"))
                     logger.info("DOM diagnostic — forms: %s", dom_diag.get("forms"))
 
-                    # ── SET TOKEN + INVOKE CAPTURED CALLBACK ──
+                    # ── SET TOKEN + HIDDEN INPUT + INVOKE CALLBACKS ──
                     inject_result = await page.evaluate("""
                         (token) => {
-                            const r = {};
+                            var r = {};
                             window.__captchaToken = token;
                             r.token_set = true;
 
@@ -1423,6 +1416,55 @@ async def _do_login() -> dict:
                             r.cb_captured = !!window.__turnstileCallback;
                             r.all_cbs = (window.__allTurnstileCallbacks || []).length;
                             r.sitekey = window.__capturedTurnstileSitekey || null;
+
+                            // ── KEY FIX: Set the hidden cf-turnstile-response input ──
+                            // Cloudflare Turnstile puts the token in this hidden input.
+                            // Angular's appcloudflarerecaptcha directive reads it.
+                            // By setting it + dispatching events, Angular picks up the token.
+                            var cfInput = document.querySelector(
+                                'input[name="cf-turnstile-response"]');
+                            if (cfInput) {
+                                cfInput.value = token;
+                                cfInput.dispatchEvent(new Event('input', {bubbles: true}));
+                                cfInput.dispatchEvent(new Event('change', {bubbles: true}));
+                                // Also dispatch on the parent container
+                                var container = cfInput.closest(
+                                    'app-cloudflare-captcha-container, [appcloudflarerecaptcha]');
+                                if (container) {
+                                    container.dispatchEvent(new Event('input', {bubbles: true}));
+                                    container.dispatchEvent(new Event('change', {bubbles: true}));
+                                    container.dispatchEvent(new CustomEvent('resolved', {
+                                        detail: token, bubbles: true}));
+                                }
+                                r.cf_input_set = true;
+                                r.cf_input_id = cfInput.id || '';
+                                console.log('CF_INPUT_SET id=' + cfInput.id +
+                                            ' len=' + token.length);
+                            } else {
+                                r.cf_input_set = false;
+                                console.log('CF_INPUT_NOT_FOUND');
+                            }
+
+                            // Also try: call turnstile.render() ourselves on the
+                            // captcha container div to trigger the callback chain
+                            var captchaDiv = document.querySelector(
+                                '[appcloudflarerecaptcha], ' +
+                                'app-cloudflare-captcha-container > div');
+                            if (captchaDiv && window.turnstile && window.turnstile.render) {
+                                try {
+                                    window.turnstile.render(captchaDiv, {
+                                        sitekey: window.__capturedTurnstileSitekey ||
+                                                 '0x4AAAAAABhlz7Ei4byodYjs',
+                                        callback: function(t) {
+                                            console.log('SELF_RENDER_CB len=' + (t||'').length);
+                                        }
+                                    });
+                                    r.self_render = true;
+                                    console.log('SELF_RENDER_OK');
+                                } catch(e) {
+                                    r.self_render_err = e.message;
+                                }
+                            }
 
                             // Invoke ALL captured callbacks with token
                             var cbs = window.__allTurnstileCallbacks || [];
@@ -1437,11 +1479,11 @@ async def _do_login() -> dict:
                                 }
                             }
 
-                            // Check button state after invoking callbacks
+                            // Check button state after all injections
                             var btns = document.querySelectorAll('button');
                             for (var b of btns) {
                                 if ((b.textContent || '').includes('Sign In')) {
-                                    r.btn_disabled = b.disabled;
+                                    r.btn_disabled_after = b.disabled;
                                     break;
                                 }
                             }
@@ -1450,6 +1492,29 @@ async def _do_login() -> dict:
                         }
                     """, token)
                     logger.info("Token inject result: %s", inject_result)
+
+                    # Wait for Angular change detection to process the input
+                    await page.wait_for_timeout(2000)
+
+                    # Check if button enabled after setting hidden input
+                    btn_check = await page.evaluate("""
+                        () => {
+                            var r = {};
+                            var btns = document.querySelectorAll('button');
+                            for (var b of btns) {
+                                if ((b.textContent || '').includes('Sign In')) {
+                                    r.disabled = b.disabled;
+                                    break;
+                                }
+                            }
+                            // Also check the hidden input value
+                            var cfInput = document.querySelector(
+                                'input[name="cf-turnstile-response"]');
+                            r.cf_has_value = !!(cfInput && cfInput.value);
+                            return r;
+                        }
+                    """)
+                    logger.info("Post-inject button check: %s", btn_check)
 
                     # If no callback was captured, Angular may not have called
                     # render() yet. Try dispatching 'load' on volt-recaptcha
@@ -1847,104 +1912,75 @@ async def _do_login() -> dict:
                             }
                         """, token)
 
-                # At 40s mark, NUCLEAR FALLBACK — direct login via fetch()
-                # If Angular's form validation blocks the POST, bypass it entirely
+                # At 40s mark, NUCLEAR FALLBACK — direct login via Playwright request
+                # Bypasses both Angular form validation AND CORS restrictions
+                # Uses Playwright's request API (not page.evaluate fetch)
                 if nav_wait == 20 and "login" in current_url and token:
-                    logger.info("40s elapsed — NUCLEAR: direct login via fetch()")
-                    nuclear_result = await page.evaluate("""
-                        async (args) => {
-                            var r = {};
-                            var email = args[0];
-                            var captchaToken = args[1];
-
-                            // Read password from form
-                            var pwInput = document.querySelector(
-                                'input[type="password"]');
-                            var password = pwInput ? pwInput.value : '';
-                            r.has_password = !!password;
-
-                            if (!password) {
-                                r.error = 'No password in form';
-                                return r;
-                            }
-
-                            // Find the login API URL from Angular's network requests
-                            // or try common VFS endpoint patterns
-                            var loginUrls = [];
-
-                            // Check if Angular has already tried to make any API calls
-                            // by looking at performance entries
-                            try {
-                                var entries = performance.getEntriesByType('resource');
-                                for (var i = 0; i < entries.length; i++) {
-                                    var e = entries[i];
-                                    if (e.name.indexOf('lift-api.vfsglobal.com') >= 0) {
-                                        r.apiCalls = r.apiCalls || [];
-                                        r.apiCalls.push(e.name.substring(0, 120));
-                                    }
-                                }
-                            } catch(e) {}
-
-                            // Try common VFS login endpoints
-                            loginUrls = [
-                                'https://lift-api.vfsglobal.com/master/login',
-                                'https://lift-api.vfsglobal.com/account/login',
-                                'https://lift-api.vfsglobal.com/login'
-                            ];
-
-                            var body = {
-                                username: email,
-                                password: password,
-                                captcha_api_key: captchaToken,
-                                captcha_version: 'Turnstile'
-                            };
-
-                            for (var ui = 0; ui < loginUrls.length; ui++) {
-                                var url = loginUrls[ui];
-                                try {
-                                    var resp = await fetch(url, {
-                                        method: 'POST',
-                                        headers: {
-                                            'Content-Type': 'application/json',
-                                            'Accept': 'application/json, text/plain, */*',
-                                            'Origin': 'https://visa.vfsglobal.com',
-                                            'Referer': 'https://visa.vfsglobal.com/',
-                                            'Route': 'are/en/prt'
-                                        },
-                                        body: JSON.stringify(body)
-                                    });
-                                    r.url = url;
-                                    r.status = resp.status;
-                                    var text = await resp.text();
-                                    r.resp = text.substring(0, 500);
-
-                                    // If we got a real response (not 404), stop trying
-                                    if (resp.status !== 404) {
-                                        // Try to parse and store JWT if present
-                                        try {
-                                            var data = JSON.parse(text);
-                                            if (data.token || data.jwt || data.JWT ||
-                                                data.authorize || data.accessToken) {
-                                                r.gotToken = true;
-                                                var tok = data.token || data.jwt || data.JWT ||
-                                                          data.authorize || data.accessToken;
-                                                // Store in sessionStorage for normal flow
-                                                window.sessionStorage.setItem('JWT', tok);
-                                                r.jwtStored = true;
-                                            }
-                                        } catch(e) {}
-                                        break;
-                                    }
-                                } catch(e) {
-                                    r.url = url;
-                                    r.fetchErr = e.message;
-                                }
-                            }
-
-                            return r;
+                    logger.info("40s elapsed — NUCLEAR: direct login via Playwright request")
+                    # Read password from form
+                    password = await page.evaluate("""
+                        () => {
+                            var pw = document.querySelector('input[type="password"]');
+                            return pw ? pw.value : '';
                         }
-                    """, [VFS_EMAIL, token])
-                    logger.info("NUCLEAR fetch result: %s", nuclear_result)
+                    """)
+                    if password:
+                        login_urls = [
+                            "https://lift-api.vfsglobal.com/master/login",
+                            "https://lift-api.vfsglobal.com/account/login",
+                            "https://lift-api.vfsglobal.com/login",
+                        ]
+                        login_body = {
+                            "username": VFS_EMAIL,
+                            "password": password,
+                            "captcha_api_key": token,
+                            "captcha_version": "Turnstile",
+                        }
+                        import json as json_mod
+                        for login_url in login_urls:
+                            try:
+                                resp = await page.request.post(
+                                    login_url,
+                                    data=json_mod.dumps(login_body),
+                                    headers={
+                                        "Content-Type": "application/json",
+                                        "Accept": "application/json, text/plain, */*",
+                                        "Origin": "https://visa.vfsglobal.com",
+                                        "Referer": "https://visa.vfsglobal.com/",
+                                        "Route": "are/en/prt",
+                                    },
+                                )
+                                status = resp.status
+                                body_text = await resp.text()
+                                logger.info("NUCLEAR %s → status=%d body=%s",
+                                            login_url, status, body_text[:500])
+                                if status != 404:
+                                    # Got a real response — check for JWT
+                                    try:
+                                        data = json_mod.loads(body_text)
+                                        jwt_key = None
+                                        for k in ("token", "jwt", "JWT",
+                                                   "authorize", "accessToken"):
+                                            if data.get(k):
+                                                jwt_key = k
+                                                break
+                                        if jwt_key:
+                                            logger.info("NUCLEAR: Got JWT via key '%s'!",
+                                                        jwt_key)
+                                            # Store in sessionStorage
+                                            await page.evaluate(
+                                                "(t) => window.sessionStorage.setItem('JWT', t)",
+                                                data[jwt_key],
+                                            )
+                                            captured_headers["authorize"] = data[jwt_key]
+                                            login_success = True
+                                    except Exception as e:
+                                        logger.info("NUCLEAR: parse error: %s", e)
+                                    break
+                            except Exception as e:
+                                logger.info("NUCLEAR %s failed: %s", login_url, e)
+                    else:
+                        logger.warning("NUCLEAR: no password in form")
 
                 await page.wait_for_timeout(2000)
 
