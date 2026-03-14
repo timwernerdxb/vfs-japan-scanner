@@ -425,7 +425,7 @@ async def _do_login() -> dict:
         try:
             # Navigate to login page
             logger.info("Navigating to VFS login page...")
-            await page.goto(VFS_LOGIN_URL, wait_until="load", timeout=60000)
+            await page.goto(VFS_LOGIN_URL, wait_until="load", timeout=120000)
 
             # Check if VFS blocked us (redirects to page-not-found)
             if "page-not-found" in page.url:
@@ -476,7 +476,7 @@ async def _do_login() -> dict:
 
             # Step 2: Wait for Angular to bootstrap
             logger.info("Waiting for Angular to bootstrap...")
-            for attempt_wait in range(12):  # Up to 120s total (12 x 10s)
+            for attempt_wait in range(18):  # Up to 180s total (18 x 10s)
                 try:
                     await page.wait_for_selector(
                         "#mat-input-0, input[type='email'], app-login input, mat-form-field",
@@ -640,13 +640,13 @@ async def _do_login() -> dict:
             logger.info("Looking for Sign In button...")
             sign_in = page.locator('button[type="submit"]:has-text("Sign In")')
             try:
-                await sign_in.wait_for(state="attached", timeout=30000)
+                await sign_in.wait_for(state="attached", timeout=60000)
                 logger.info("Sign In button found in DOM")
             except Exception:
                 # Fallback: try broader selector
                 sign_in = page.locator('button:has-text("Sign In")')
                 try:
-                    await sign_in.wait_for(state="attached", timeout=10000)
+                    await sign_in.wait_for(state="attached", timeout=30000)
                     logger.info("Sign In button found (broad selector)")
                 except Exception:
                     logger.error("Sign In button not found on page")
@@ -654,7 +654,7 @@ async def _do_login() -> dict:
                     raise RuntimeError("Could not find submit button")
 
             # Wait for button to become enabled (Turnstile solving in background)
-            for wait_i in range(12):  # 12 × 5s = 60s max
+            for wait_i in range(18):  # 18 × 5s = 90s max
                 is_disabled = await sign_in.is_disabled()
                 if not is_disabled:
                     logger.info("Sign In button is enabled!")
@@ -662,8 +662,8 @@ async def _do_login() -> dict:
                 logger.info("Sign In button still disabled (%d/9)...", wait_i + 1)
                 await page.wait_for_timeout(5000)
             else:
-                # Button stayed disabled after 60s — force-enable via JS
-                logger.warning("Sign In button still disabled after 60s — force-enabling")
+                # Button stayed disabled after 90s — force-enable via JS
+                logger.warning("Sign In button still disabled after 90s — force-enabling")
                 await page.evaluate("""
                     () => {
                         const btn = document.querySelector('button[type="submit"]');
