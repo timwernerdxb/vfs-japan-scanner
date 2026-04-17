@@ -45,6 +45,9 @@ GO_TO_BAG_SELECTORS = [
 ]
 
 CHECKOUT_SELECTORS = [
+    'button:has-text("CONTINUAR"):not([disabled])',
+    'button:has-text("Continuar"):not([disabled])',
+    'a:has-text("Continuar")',
     'button:has-text("FINALIZAR COMPRA")',
     'button:has-text("Finalizar compra")',
     'a:has-text("Finalizar compra")',
