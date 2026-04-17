@@ -65,7 +65,12 @@ PRIMARY_ACTION_SELECTORS = [
 
 # Text that means we've reached the final review/pay step. Matching these
 # stops the continue-loop before we accidentally click them.
-NEGATIVE_TEXTS = ("cancelar", "voltar", "retornar", "sair", "editar", "remover", "código")
+NEGATIVE_TEXTS = (
+    "cancelar", "voltar", "retornar", "sair", "editar", "remover", "código",
+    "comprando",        # "Continuar comprando" = continue shopping (goes back)
+    "adicionar ao favoritos", "salvar",
+    "aplicar cupom", "cupom",
+)
 
 # Text that indicates we've reached the final review/pay step — we stop
 # before clicking these unless dry_run=False.
@@ -97,19 +102,31 @@ class PurchaseOutcome:
 async def _click_first(page: Page, selectors: list[str], timeout_ms: int = 5000) -> bool:
     for sel in selectors:
         try:
-            el = page.locator(sel).first
-            await el.wait_for(state="visible", timeout=timeout_ms)
-            text = ((await el.text_content()) or "").lower().strip()
-            if any(neg in text for neg in NEGATIVE_TEXTS):
-                logger.debug("Skipping %s — text %r contains negative keyword", sel, text)
+            loc = page.locator(sel)
+            try:
+                await loc.first.wait_for(state="visible", timeout=timeout_ms)
+            except PlaywrightTimeout:
                 continue
-            await el.click()
-            logger.info("Clicked %s (text=%r)", sel, text)
-            return True
-        except PlaywrightTimeout:
-            continue
+            count = await loc.count()
+            for i in range(count):
+                el = loc.nth(i)
+                try:
+                    if not await el.is_visible(timeout=500):
+                        continue
+                    text = ((await el.text_content()) or "").lower().strip()
+                    if any(neg in text for neg in NEGATIVE_TEXTS):
+                        logger.debug(
+                            "Skipping match %d of %s (text=%r, negative)",
+                            i, sel, text,
+                        )
+                        continue
+                    await el.click()
+                    logger.info("Clicked %s [%d] (text=%r)", sel, i, text)
+                    return True
+                except Exception as e:
+                    logger.debug("Inner click #%d of %s failed: %s", i, sel, e)
         except Exception as e:
-            logger.debug("Click %s failed: %s", sel, e)
+            logger.debug("Outer %s failed: %s", sel, e)
     return False
 
 
