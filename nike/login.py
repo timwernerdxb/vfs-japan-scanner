@@ -167,14 +167,27 @@ async def login(context: BrowserContext, page: Page, cfg: NikeConfig) -> bool:
 
     logger.info("Now on: %s", page.url)
 
-    if not await _fill_first_match(page, EMAIL_SELECTORS, cfg.email):
-        logger.error("Could not find email field")
-        await _debug_dump(page, "login-no-email")
-        return False
+    # If Nike remembers the email it shows a "Continuar como <email>" card
+    # instead of an email input. Detect that and click Continuar.
+    email_filled = await _fill_first_match(page, EMAIL_SELECTORS, cfg.email)
 
-    # Email-first flow: submit email, then switch to password login
-    await _click_first_match(page, SUBMIT_SELECTORS)
-    await asyncio.sleep(3)
+    if email_filled:
+        # Email-first flow: submit email
+        await _click_first_match(page, SUBMIT_SELECTORS)
+        await asyncio.sleep(3)
+    else:
+        # Saved-email flow: just click continue / confirm
+        logger.info("No email input — assuming saved-email 'Continuar' flow")
+        continue_selectors = [
+            'button:has-text("Continuar"):not([disabled])',
+            'button:has-text("CONTINUAR"):not([disabled])',
+            f'button:has-text("{cfg.email}")',
+        ]
+        if not await _click_first_match(page, continue_selectors):
+            logger.error("Could not find email field or Continuar button")
+            await _debug_dump(page, "login-no-email")
+            return False
+        await asyncio.sleep(3)
 
     # Nike defaults to 8-digit email code — switch to password login
     if await _click_first_match(page, USE_PASSWORD_SELECTORS):
