@@ -12,4 +12,6 @@ RUN patchright install --with-deps chromium
 # Copy application code
 COPY . .
 
+# Default entrypoint is the VFS scanner. For the Nike purchase service,
+# set Railway's startCommand override to: python nike_main.py
 CMD ["python", "main.py"]
