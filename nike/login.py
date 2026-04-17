@@ -63,6 +63,13 @@ SUBMIT_SELECTORS = [
     'button[data-testid="submit-button"]',
 ]
 
+USE_PASSWORD_SELECTORS = [
+    'button:has-text("Usar a senha")',
+    'button:has-text("USAR A SENHA")',
+    'a:has-text("Usar a senha")',
+    'button:has-text("Use password")',
+]
+
 
 async def _fill_first_match(page: Page, selectors: list[str], value: str) -> bool:
     for sel in selectors:
@@ -154,9 +161,16 @@ async def login(context: BrowserContext, page: Page, cfg: NikeConfig) -> bool:
         await _debug_dump(page, "login-no-email")
         return False
 
-    # Some flows have email-first then password
+    # Email-first flow: submit email, then switch to password login
     await _click_first_match(page, SUBMIT_SELECTORS)
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
+
+    # Nike defaults to 8-digit email code — switch to password login
+    if await _click_first_match(page, USE_PASSWORD_SELECTORS):
+        logger.info("Switched to password login")
+        await asyncio.sleep(2)
+    else:
+        logger.info("No 'Usar a senha' button — assuming password form is already shown")
 
     if not await _fill_first_match(page, PASSWORD_SELECTORS, cfg.password):
         logger.error("Could not find password field")
