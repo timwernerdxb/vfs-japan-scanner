@@ -180,13 +180,10 @@ async def _run_checkout(
     page: Page, cfg: NikeConfig, attempts: int, start: float
 ) -> PurchaseOutcome:
     """Walk from cart confirmation through checkout to final pay button."""
-    logger.info("Added to cart — navigating to bag")
-    await asyncio.sleep(1)
-
-    if not await _click_first(page, GO_TO_BAG_SELECTORS, timeout_ms=8000):
-        await page.goto("https://www.nike.com.br/carrinho", wait_until="domcontentloaded")
-
+    logger.info("Added to cart — navigating directly to /carrinho")
     await asyncio.sleep(2)
+    await page.goto("https://www.nike.com.br/carrinho", wait_until="domcontentloaded", timeout=30000)
+    await asyncio.sleep(3)
 
     if not await _click_first(page, CHECKOUT_SELECTORS, timeout_ms=10000):
         return PurchaseOutcome(

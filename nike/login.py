@@ -30,11 +30,13 @@ COOKIE_ACCEPT_SELECTORS = [
 ]
 
 ENTRAR_LINK_SELECTORS = [
-    'a:has-text("Entrar")',
-    'a:has-text("ENTRAR")',
-    'button:has-text("Entrar")',
-    'a[href*="login"]',
-    'a[href*="signin"]',
+    'header a:text-is("Entrar")',
+    'nav a:text-is("Entrar")',
+    'a:text-is("Entrar")',
+    'header a:text-is("ENTRAR")',
+    'a:text-is("ENTRAR")',
+    'header button:text-is("Entrar")',
+    'button:text-is("Entrar")',
 ]
 
 EMAIL_SELECTORS = [
