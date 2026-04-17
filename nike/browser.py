@@ -1,4 +1,10 @@
-"""Patchright (stealth Playwright) browser setup for Nike.com.br."""
+"""Patchright (stealth Playwright) browser setup for Nike.com.br.
+
+Uses `launch_persistent_context` (as recommended by the Patchright docs for
+maximum stealth) with a persistent user data dir so cookies, fingerprint,
+and device state carry over across runs. This is harder for Akamai / Kasada /
+PerimeterX-style bot managers to detect than a fresh launch with extra args.
+"""
 
 from __future__ import annotations
 
@@ -15,47 +21,44 @@ logger = logging.getLogger("nike.browser")
 
 @asynccontextmanager
 async def browser_context(cfg: NikeConfig):
-    """Yield a (browser, context, page) tuple with stealth settings.
+    """Yield a (browser, context, page) tuple with stealth settings."""
+    user_data_dir = os.environ.get(
+        "NIKE_USER_DATA_DIR", "/tmp/nike-user-data"
+    )
+    os.makedirs(user_data_dir, exist_ok=True)
+    logger.info("Using persistent user data dir: %s", user_data_dir)
 
-    Reuses a persisted storage_state if present so we don't have to log in
-    on every run.
-    """
     async with async_playwright() as pw:
-        launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--no-sandbox",
-        ]
-        browser = await pw.chromium.launch(
-            headless=cfg.headless,
-            args=launch_args,
-        )
-
-        storage_state = (
-            cfg.storage_state_path
-            if cfg.storage_state_path and os.path.exists(cfg.storage_state_path)
-            else None
-        )
-        if storage_state:
-            logger.info("Loading stored session: %s", storage_state)
-
-        context = await browser.new_context(
-            user_agent=cfg.user_agent,
-            locale="pt-BR",
-            timezone_id=cfg.timezone,
-            viewport={"width": 1366, "height": 768},
-            storage_state=storage_state,
-        )
-
-        page = await context.new_page()
+        # Per Patchright docs: no custom args, use channel="chrome" if real
+        # Chrome is installed (even better stealth). Fall back to bundled
+        # Chromium otherwise.
+        channel = os.environ.get("NIKE_BROWSER_CHANNEL", "chrome")
         try:
-            yield browser, context, page
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel=channel,
+                headless=cfg.headless,
+                no_viewport=True,
+                locale="pt-BR",
+                timezone_id=cfg.timezone,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not launch with channel=%s (%s), falling back to bundled chromium",
+                channel, e,
+            )
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=cfg.headless,
+                no_viewport=True,
+                locale="pt-BR",
+                timezone_id=cfg.timezone,
+            )
+
+        # Persistent context always has at least one page
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        try:
+            yield None, context, page
         finally:
-            try:
-                if cfg.storage_state_path:
-                    await context.storage_state(path=cfg.storage_state_path)
-                    logger.info("Saved session to %s", cfg.storage_state_path)
-            except Exception as e:
-                logger.warning("Could not save storage state: %s", e)
             await context.close()
-            await browser.close()
