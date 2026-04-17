@@ -8,14 +8,19 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 
+_QUOTE_CHARS = {
+    "'", '"',
+    "\u2018", "\u2019",  # ' '  curly single
+    "\u201c", "\u201d",  # " "  curly double
+}
+
+
 def _env(name: str, default: str = "") -> str:
     val = os.environ.get(name, default).strip()
-    # Strip surrounding quotes if someone exported with extra quoting
-    # (e.g. NIKE_PASSWORD="'value'")
-    for q in ("'", '"'):
-        if len(val) >= 2 and val[0] == q and val[-1] == q:
-            val = val[1:-1]
-            break
+    # Strip surrounding quote-like characters (incl. curly quotes from
+    # copy-paste via Terminal / chat apps).
+    while len(val) >= 2 and val[0] in _QUOTE_CHARS and val[-1] in _QUOTE_CHARS:
+        val = val[1:-1]
     return val
 
 
