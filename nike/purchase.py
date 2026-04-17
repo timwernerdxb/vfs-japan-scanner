@@ -25,6 +25,8 @@ logger = logging.getLogger("nike.purchase")
 
 
 ADD_TO_CART_SELECTORS = [
+    'button:has-text("ADICIONAR AO CARRINHO")',
+    'button:has-text("Adicionar ao carrinho")',
     'button:has-text("COMPRAR")',
     'button:has-text("Comprar")',
     'button:has-text("ADICIONAR À SACOLA")',
@@ -36,6 +38,8 @@ ADD_TO_CART_SELECTORS = [
 GO_TO_BAG_SELECTORS = [
     'a[href*="/carrinho"]',
     'a[href*="/cart"]',
+    'button:has-text("IR PARA O CARRINHO")',
+    'button:has-text("Ir para o carrinho")',
     'button:has-text("IR PARA A SACOLA")',
     'button:has-text("Ir para a sacola")',
 ]
