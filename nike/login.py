@@ -69,6 +69,16 @@ USE_PASSWORD_SELECTORS = [
     'button:has-text("Use password")',
 ]
 
+OTP_INPUT_SELECTORS = [
+    'input[name="code"]',
+    'input[name="otp"]',
+    'input[name="verificationCode"]',
+    'input[autocomplete="one-time-code"]',
+    'input[placeholder*="código" i]',
+    'input[placeholder*="dígitos" i]',
+    'input[inputmode="numeric"]',
+]
+
 
 async def _fill_first_match(page: Page, selectors: list[str], value: str) -> bool:
     for sel in selectors:
@@ -177,9 +187,12 @@ async def login(context: BrowserContext, page: Page, cfg: NikeConfig) -> bool:
         return False
 
     await _click_first_match(page, SUBMIT_SELECTORS)
-
-    # Wait for redirect away from login / modal to close
     await asyncio.sleep(5)
+
+    # Handle one-time-code challenge (Nike triggers this after repeated
+    # failed logins or from a new device). Prompt the user interactively.
+    if await _handle_otp_challenge(page, cfg):
+        await asyncio.sleep(5)
 
     if await is_logged_in(context):
         logger.info("Login successful")
@@ -188,6 +201,68 @@ async def login(context: BrowserContext, page: Page, cfg: NikeConfig) -> bool:
     logger.error("Login did not produce auth cookies")
     await _debug_dump(page, "login-failed")
     return False
+
+
+async def _handle_otp_challenge(page: Page, cfg: NikeConfig) -> bool:
+    """If an OTP input is shown, prompt the user to enter the code.
+
+    Returns True if we handled an OTP (regardless of success), False if
+    no OTP screen was detected.
+    """
+    import os
+    import sys
+
+    otp_visible = False
+    for sel in OTP_INPUT_SELECTORS:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=1500):
+                otp_visible = True
+                break
+        except Exception:
+            continue
+
+    if not otp_visible:
+        return False
+
+    logger.warning(
+        "Nike is asking for a verification code. Check your email for the "
+        "8-digit code."
+    )
+
+    if not sys.stdin.isatty():
+        env_code = os.environ.get("NIKE_OTP_CODE", "").strip()
+        if env_code:
+            logger.info("Using NIKE_OTP_CODE from env")
+            code = env_code
+        else:
+            logger.error(
+                "OTP required but no TTY and NIKE_OTP_CODE not set. "
+                "Run interactively to enter the code, or set NIKE_OTP_CODE."
+            )
+            return True
+    else:
+        code = await asyncio.to_thread(
+            input, "Enter the 8-digit code from your email and press Enter: "
+        )
+        code = code.strip()
+
+    if not code:
+        logger.error("No OTP code provided")
+        return True
+
+    for sel in OTP_INPUT_SELECTORS:
+        try:
+            el = page.locator(sel).first
+            await el.wait_for(state="visible", timeout=1500)
+            await el.fill(code)
+            logger.info("Filled OTP code")
+            break
+        except Exception:
+            continue
+
+    await _click_first_match(page, SUBMIT_SELECTORS)
+    return True
 
 
 async def _debug_dump(page: Page, tag: str) -> None:
