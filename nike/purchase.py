@@ -44,23 +44,31 @@ GO_TO_BAG_SELECTORS = [
     'button:has-text("Ir para a sacola")',
 ]
 
-CHECKOUT_SELECTORS = [
+CONTINUE_SELECTORS = [
     'button:has-text("CONTINUAR"):not([disabled])',
     'button:has-text("Continuar"):not([disabled])',
+    'button:has-text("FINALIZAR COMPRA"):not([disabled])',
+    'button:has-text("Finalizar compra"):not([disabled])',
+    'button:has-text("AVANÇAR"):not([disabled])',
+    'button:has-text("Avançar"):not([disabled])',
     'a:has-text("Continuar")',
-    'button:has-text("FINALIZAR COMPRA")',
-    'button:has-text("Finalizar compra")',
     'a:has-text("Finalizar compra")',
-    'button[data-testid="checkout-button"]',
 ]
 
-FINAL_PAY_SELECTORS = [
-    'button:has-text("FINALIZAR PEDIDO")',
-    'button:has-text("Finalizar pedido")',
-    'button:has-text("PAGAR")',
-    'button:has-text("Pagar")',
-    'button[data-testid="place-order"]',
+# Text that indicates we've reached the final review/pay step — we stop
+# before clicking these unless dry_run=False.
+FINAL_PAY_TEXTS = [
+    "FINALIZAR PEDIDO",
+    "Finalizar pedido",
+    "PAGAR AGORA",
+    "Pagar agora",
+    "CONFIRMAR PEDIDO",
+    "Confirmar pedido",
+    "REALIZAR PEDIDO",
+    "Realizar pedido",
 ]
+
+FINAL_PAY_SELECTORS = [f'button:has-text("{t}"):not([disabled])' for t in FINAL_PAY_TEXTS]
 
 SOLD_OUT_TEXTS = ["ESGOTADO", "Esgotado", "INDISPONÍVEL", "Indisponível"]
 
@@ -179,27 +187,68 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
     )
 
 
+async def _is_final_pay_step(page: Page) -> bool:
+    """Return True if the page shows a 'final pay / confirm order' button."""
+    for t in FINAL_PAY_TEXTS:
+        try:
+            btn = page.locator(f'button:has-text("{t}")').first
+            if await btn.is_visible(timeout=500):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def _run_checkout(
     page: Page, cfg: NikeConfig, attempts: int, start: float
 ) -> PurchaseOutcome:
-    """Walk from cart confirmation through checkout to final pay button."""
+    """Walk cart → address → shipping → payment → review by clicking
+    'Continuar' at each step, until the final pay button appears."""
     logger.info("Added to cart — navigating directly to /carrinho")
     await asyncio.sleep(2)
     await page.goto("https://www.nike.com.br/carrinho", wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(3)
 
-    if not await _click_first(page, CHECKOUT_SELECTORS, timeout_ms=10000):
+    MAX_STEPS = 8
+    for step in range(1, MAX_STEPS + 1):
+        url = page.url
+        logger.info("Checkout step %d — url: %s", step, url)
+
+        if await _is_final_pay_step(page):
+            logger.info("Reached final review/pay step at step %d", step)
+            break
+
+        if not await _click_first(page, CONTINUE_SELECTORS, timeout_ms=8000):
+            logger.error("No Continuar button found at step %d (url=%s)", step, url)
+            try:
+                await page.screenshot(path=f"/tmp/nike-checkout-stuck-{step}.png", full_page=True)
+            except Exception:
+                pass
+            return PurchaseOutcome(
+                success=False, stage=f"step-{step}",
+                message=f"Stuck at checkout step {step}, url={url}. "
+                        f"See /tmp/nike-checkout-stuck-{step}.png",
+                attempts=attempts, elapsed_seconds=time.time() - start,
+            )
+
+        # Give the next step time to load. Nike checkout is SPA-ish so
+        # we wait for network to settle before looking for the next button.
+        await asyncio.sleep(2)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeout:
+            pass
+        await asyncio.sleep(1)
+    else:
         return PurchaseOutcome(
-            success=False, stage="bag", message="Could not click checkout",
+            success=False, stage="checkout-loop",
+            message=f"Walked {MAX_STEPS} steps without reaching final pay",
             attempts=attempts, elapsed_seconds=time.time() - start,
         )
 
-    logger.info("Entered checkout — waiting for review screen")
-    await asyncio.sleep(5)
-
     try:
         await page.screenshot(path="/tmp/nike-checkout-review.png", full_page=True)
-        logger.info("Saved checkout screenshot to /tmp/nike-checkout-review.png")
+        logger.info("Saved review screenshot to /tmp/nike-checkout-review.png")
     except Exception as e:
         logger.warning("Could not screenshot: %s", e)
 
@@ -222,7 +271,7 @@ async def _run_checkout(
             attempts=attempts, elapsed_seconds=time.time() - start,
         )
 
-    await asyncio.sleep(5)
+    await asyncio.sleep(8)
     try:
         await page.screenshot(path="/tmp/nike-order-confirm.png", full_page=True)
     except Exception:
@@ -230,6 +279,6 @@ async def _run_checkout(
 
     return PurchaseOutcome(
         success=True, stage="submitted",
-        message="Final pay button clicked; see /tmp/nike-order-confirm.png for confirmation",
+        message="Final pay button clicked; see /tmp/nike-order-confirm.png",
         attempts=attempts, elapsed_seconds=time.time() - start,
     )
