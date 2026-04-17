@@ -9,7 +9,14 @@ from zoneinfo import ZoneInfo
 
 
 def _env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+    val = os.environ.get(name, default).strip()
+    # Strip surrounding quotes if someone exported with extra quoting
+    # (e.g. NIKE_PASSWORD="'value'")
+    for q in ("'", '"'):
+        if len(val) >= 2 and val[0] == q and val[-1] == q:
+            val = val[1:-1]
+            break
+    return val
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
