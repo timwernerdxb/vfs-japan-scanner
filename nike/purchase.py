@@ -44,16 +44,28 @@ GO_TO_BAG_SELECTORS = [
     'button:has-text("Ir para a sacola")',
 ]
 
-CONTINUE_SELECTORS = [
-    'button:has-text("CONTINUAR"):not([disabled])',
+# Primary action buttons — matched by semantic class/role/testid first
+# (language-independent), with Portuguese text fallbacks.
+PRIMARY_ACTION_SELECTORS = [
+    'button[data-testid*="continue" i]:not([disabled])',
+    'button[data-testid*="checkout" i]:not([disabled])',
+    'button[data-testid*="submit" i]:not([disabled])',
+    'button[data-testid*="place-order" i]:not([disabled])',
+    'button[data-testid*="next" i]:not([disabled])',
+    'button[class*="btn-primary"]:not([disabled])',
+    'button[class*="primary" i]:not([disabled])',
+    'button[class*="nds-btn-primary" i]:not([disabled])',
     'button:has-text("Continuar"):not([disabled])',
-    'button:has-text("FINALIZAR COMPRA"):not([disabled])',
-    'button:has-text("Finalizar compra"):not([disabled])',
-    'button:has-text("AVANÇAR"):not([disabled])',
+    'button:has-text("CONTINUAR"):not([disabled])',
     'button:has-text("Avançar"):not([disabled])',
-    'a:has-text("Continuar")',
-    'a:has-text("Finalizar compra")',
+    'button:has-text("AVANÇAR"):not([disabled])',
+    'button:has-text("Finalizar compra"):not([disabled])',
+    'button:has-text("FINALIZAR COMPRA"):not([disabled])',
 ]
+
+# Text that means we've reached the final review/pay step. Matching these
+# stops the continue-loop before we accidentally click them.
+NEGATIVE_TEXTS = ("cancelar", "voltar", "retornar", "sair", "editar", "remover", "código")
 
 # Text that indicates we've reached the final review/pay step — we stop
 # before clicking these unless dry_run=False.
@@ -87,8 +99,12 @@ async def _click_first(page: Page, selectors: list[str], timeout_ms: int = 5000)
         try:
             el = page.locator(sel).first
             await el.wait_for(state="visible", timeout=timeout_ms)
+            text = ((await el.text_content()) or "").lower().strip()
+            if any(neg in text for neg in NEGATIVE_TEXTS):
+                logger.debug("Skipping %s — text %r contains negative keyword", sel, text)
+                continue
             await el.click()
-            logger.info("Clicked %s", sel)
+            logger.info("Clicked %s (text=%r)", sel, text)
             return True
         except PlaywrightTimeout:
             continue
@@ -218,7 +234,7 @@ async def _run_checkout(
             logger.info("Reached final review/pay step at step %d", step)
             break
 
-        if not await _click_first(page, CONTINUE_SELECTORS, timeout_ms=8000):
+        if not await _click_first(page, PRIMARY_ACTION_SELECTORS, timeout_ms=8000):
             logger.error("No Continuar button found at step %d (url=%s)", step, url)
             try:
                 await page.screenshot(path=f"/tmp/nike-checkout-stuck-{step}.png", full_page=True)
