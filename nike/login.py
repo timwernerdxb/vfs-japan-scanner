@@ -55,11 +55,10 @@ PASSWORD_SELECTORS = [
 ]
 
 SUBMIT_SELECTORS = [
-    'button[type="submit"]:not([disabled])',
-    'button:has-text("ENTRAR"):not([disabled])',
-    'button:has-text("Entrar"):not([disabled])',
-    'button:has-text("SIGN IN"):not([disabled])',
+    'button:has-text("ENTRAR"):not(:has-text("código")):not([disabled])',
+    'button:has-text("Entrar"):not(:has-text("código")):not([disabled])',
     'button:has-text("Continuar"):not([disabled])',
+    'button:has-text("SIGN IN"):not([disabled])',
     'button[data-testid="submit-button"]',
 ]
 
