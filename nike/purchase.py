@@ -609,6 +609,60 @@ async def _find_product_via_search(page: Page, query: str, deadline: float) -> b
     return False
 
 
+async def _navigate_via_favorites(page: Page, cfg: NikeConfig) -> bool:
+    """Fallback: open /favoritos, click the matching product tile.
+
+    Used on drop day when the direct product URL stays stuck on
+    'Disponível em DD/MM' but the favorite row starts showing a buy
+    button (SNKRS sometimes flips favorites first).
+    """
+    try:
+        await page.goto("https://www.nike.com.br/favoritos", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+    except Exception as e:
+        logger.warning("Could not load /favoritos: %s", e)
+        return False
+
+    target_slug = None
+    if cfg.product_url:
+        # Pull the product slug out of the URL so we click the right tile.
+        try:
+            path = cfg.product_url.split("/")[-1].split("?")[0]
+            target_slug = path.replace(".html", "")
+        except Exception:
+            target_slug = None
+    logger.info("Favorites fallback — looking for slug %r", target_slug)
+
+    # Prefer an exact slug match; otherwise fall back to first product tile.
+    selectors = []
+    if target_slug:
+        selectors.append(f'a[href*="{target_slug}"]')
+    selectors.extend([
+        'a[data-testid*="product-card" i][href*="/"]',
+        'a[data-testid*="favorite" i][href*="/"]',
+        'a[href*="/"][href*=".html"]',
+    ])
+    for sel in selectors:
+        try:
+            tile = page.locator(sel).first
+            if await tile.is_visible(timeout=1500):
+                href = await tile.get_attribute("href")
+                logger.info("Favorites: clicking %s -> %s", sel, href)
+                await tile.scroll_into_view_if_needed(timeout=2000)
+                await tile.click()
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except PlaywrightTimeout:
+                    pass
+                await asyncio.sleep(2)
+                return True
+        except Exception as e:
+            logger.debug("Favorites selector %s failed: %s", sel, e)
+            continue
+    logger.info("Favorites: no matching tile found")
+    return False
+
+
 async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOutcome:
     """Refresh product page until target size is buyable, then purchase."""
     start = time.time()
@@ -637,6 +691,7 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
                 attempts=0, elapsed_seconds=time.time() - start,
             )
 
+    tried_favorites = False
     while time.time() < deadline:
         attempts += 1
 
@@ -654,6 +709,15 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
             logger.info("[attempt %d] sold out", attempts)
         else:
             logger.info("[attempt %d] size %s not selectable yet", attempts, cfg.product_size)
+
+        # Every 8 attempts (≈6-8s), and once per run, try the /favoritos
+        # path — sometimes SNKRS flips a favorited item to purchasable on
+        # that page before the direct PDP updates.
+        if cfg.product_url and attempts % 8 == 0 and not tried_favorites:
+            tried_favorites = True
+            logger.info("[attempt %d] trying /favoritos fallback", attempts)
+            if await _navigate_via_favorites(page, cfg):
+                continue  # Re-enter loop on the favorites-opened PDP
 
         await asyncio.sleep(interval)
         try:
