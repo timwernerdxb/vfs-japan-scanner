@@ -118,8 +118,22 @@ async def browser_context(cfg: NikeConfig):
                 )
                 context = await pw.chromium.launch_persistent_context(**launch_kwargs)
             if storage.get("cookies"):
-                await context.add_cookies(storage["cookies"])
-                logger.info("Injected %d cookies", len(storage["cookies"]))
+                # Drop Akamai bot-manager / CDN cookies — they are bound to
+                # the client IP and fingerprint that originally issued them;
+                # reusing them from a different egress IP trips Akamai's
+                # "Access Denied" on product PDPs. Keep only the tokens
+                # Nike actually uses for auth / session.
+                AKAMAI_PREFIXES = ("_abck", "ak_bmsc", "bm_", "sec_cpt", "AKA_A2", "RT")
+                kept = [
+                    c for c in storage["cookies"]
+                    if not any(c.get("name", "").startswith(p) for p in AKAMAI_PREFIXES)
+                ]
+                dropped = len(storage["cookies"]) - len(kept)
+                await context.add_cookies(kept)
+                logger.info(
+                    "Injected %d cookies (dropped %d Akamai-bound)",
+                    len(kept), dropped,
+                )
             page = context.pages[0] if context.pages else await context.new_page()
             try:
                 yield None, context, page

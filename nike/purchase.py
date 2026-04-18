@@ -712,6 +712,15 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
     await _clear_cart(page)
 
     if cfg.product_url:
+        # Warmup: hit the homepage first so Akamai issues fresh bot-manager
+        # tokens (_abck/bm_*) from THIS egress IP. Jumping straight to a
+        # PDP from a clean context was returning 403 on Railway — the
+        # homepage round-trip fixes that.
+        try:
+            await page.goto("https://www.nike.com.br/", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning("Homepage warmup failed (%s) — continuing anyway", e)
         await page.goto(cfg.product_url, wait_until="domcontentloaded", timeout=60000)
     else:
         ok = await _find_product_via_search(page, cfg.search_query, deadline)
