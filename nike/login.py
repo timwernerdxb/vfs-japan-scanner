@@ -57,6 +57,26 @@ async def is_logged_in(context: BrowserContext, page: Page | None = None) -> boo
         # bot-suspicious environments (Railway data-center IP) the page
         # may take longer to hydrate — wait up to 5s.
         await asyncio.sleep(5)
+        # Akamai sometimes returns a transient "Access Denied"
+        # edge-cache page that resolves after a reload. Retry up to 3x.
+        for akamai_retry in range(3):
+            try:
+                title = (await page.title()).strip()
+            except Exception:
+                title = ""
+            if title.lower().startswith("access denied"):
+                logger.info(
+                    "Akamai 'Access Denied' page (retry %d/3) — reloading",
+                    akamai_retry + 1,
+                )
+                try:
+                    await asyncio.sleep(2 + akamai_retry)
+                    await page.reload(wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(4)
+                except Exception as e:
+                    logger.debug("Akamai-retry reload failed: %s", e)
+                continue
+            break
         final = page.url.lower()
         if "login" in final or "signin" in final:
             logger.info("Account page redirected to login (%s) — not logged in", final)
