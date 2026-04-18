@@ -44,23 +44,17 @@ GO_TO_BAG_SELECTORS = [
     'button:has-text("Ir para a sacola")',
 ]
 
-# Primary action buttons — matched by semantic class/role/testid first
-# (language-independent), with Portuguese text fallbacks.
+# Primary action buttons — "next step" buttons (Continuar, Avançar) that
+# advance through the checkout funnel. These MUST NOT include anything that
+# could submit the order (place-order, finalizar compra, pagar).
 PRIMARY_ACTION_SELECTORS = [
     'button[data-testid*="continue" i]:not([disabled])',
-    'button[data-testid*="checkout" i]:not([disabled])',
-    'button[data-testid*="submit" i]:not([disabled])',
-    'button[data-testid*="place-order" i]:not([disabled])',
+    'button[data-testid*="checkout-continue" i]:not([disabled])',
     'button[data-testid*="next" i]:not([disabled])',
-    'button[class*="btn-primary"]:not([disabled])',
-    'button[class*="primary" i]:not([disabled])',
-    'button[class*="nds-btn-primary" i]:not([disabled])',
     'button:has-text("Continuar"):not([disabled])',
     'button:has-text("CONTINUAR"):not([disabled])',
     'button:has-text("Avançar"):not([disabled])',
     'button:has-text("AVANÇAR"):not([disabled])',
-    'button:has-text("Finalizar compra"):not([disabled])',
-    'button:has-text("FINALIZAR COMPRA"):not([disabled])',
 ]
 
 # Text that means we've reached the final review/pay step. Matching these
@@ -77,6 +71,8 @@ NEGATIVE_TEXTS = (
 FINAL_PAY_TEXTS = [
     "FINALIZAR PEDIDO",
     "Finalizar pedido",
+    "Finalizar compra",
+    "FINALIZAR COMPRA",
     "PAGAR AGORA",
     "Pagar agora",
     "CONFIRMAR PEDIDO",
@@ -85,7 +81,17 @@ FINAL_PAY_TEXTS = [
     "Realizar pedido",
 ]
 
-FINAL_PAY_SELECTORS = [f'button:has-text("{t}"):not([disabled])' for t in FINAL_PAY_TEXTS]
+FINAL_PAY_SELECTORS = [
+    'button[data-testid*="place-order" i]:not([disabled])',
+    'button[data-testid*="pay" i]:not([disabled])',
+    'button[data-testid*="confirm-order" i]:not([disabled])',
+    *(f'button:has-text("{t}"):not([disabled])' for t in FINAL_PAY_TEXTS),
+]
+
+# Any URL path whose presence means we're on the final review/pay page.
+# We treat these as terminal regardless of button text — prevents an
+# accidental order submit in dry_run mode.
+FINAL_STEP_URL_HINTS = ("/pagamento", "/payment", "/review", "/revisao", "/confirmar")
 
 SOLD_OUT_TEXTS = ["ESGOTADO", "Esgotado", "INDISPONÍVEL", "Indisponível"]
 
@@ -100,11 +106,17 @@ class PurchaseOutcome:
 
 
 async def _click_first(page: Page, selectors: list[str], timeout_ms: int = 5000) -> bool:
+    """Try each selector in turn with a short per-selector timeout.
+
+    `timeout_ms` is the TOTAL budget spread across all selectors — not per
+    selector. This avoids the 14-selectors × 8s = 112s worst case.
+    """
+    per_sel = max(300, timeout_ms // max(1, len(selectors)))
     for sel in selectors:
         try:
             loc = page.locator(sel)
             try:
-                await loc.first.wait_for(state="visible", timeout=timeout_ms)
+                await loc.first.wait_for(state="visible", timeout=per_sel)
             except PlaywrightTimeout:
                 continue
             count = await loc.count()
@@ -120,6 +132,10 @@ async def _click_first(page: Page, selectors: list[str], timeout_ms: int = 5000)
                             i, sel, text,
                         )
                         continue
+                    try:
+                        await el.scroll_into_view_if_needed(timeout=2000)
+                    except Exception:
+                        pass
                     await el.click()
                     logger.info("Clicked %s [%d] (text=%r)", sel, i, text)
                     return True
@@ -128,6 +144,202 @@ async def _click_first(page: Page, selectors: list[str], timeout_ms: int = 5000)
         except Exception as e:
             logger.debug("Outer %s failed: %s", sel, e)
     return False
+
+
+_TEXT_WALKER_JS = """
+(() => {
+    const re = /^\\s*continuar(?!\\s+comprando)/i;
+    const negRe = /(voltar|cancelar|sair|editar|remover|comprando)/i;
+    const cand = [];
+    const all = document.querySelectorAll('button, a, [role="button"], div[role="button"], input[type="submit"], input[type="button"]');
+    for (const el of all) {
+        const t = (el.innerText || el.textContent || el.value || '').trim();
+        if (!t || t.length > 60) continue;
+        if (negRe.test(t)) continue;
+        if (!re.test(t)) continue;
+        if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) continue;
+        cand.push({
+            text: t,
+            testid: el.getAttribute('data-testid') || '',
+            id: el.id || '',
+            tag: el.tagName,
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+        });
+        el.setAttribute('data-nike-bot-target', '1');
+    }
+    return cand;
+})()
+"""
+
+
+async def _select_default_option(page: Page) -> int:
+    """Pick the first option in every radio group that has no selection yet.
+
+    Nike's /checkout SPA stacks several sections (endereço, tipo de entrega,
+    pagamento) on the same URL. Each section is a radio group. Continuar
+    only activates when EVERY required group has a selection. So on each
+    tick we select one-per-group, not just one overall.
+
+    Returns number of groups we just picked a default for.
+    """
+    try:
+        info = await page.evaluate(
+            """() => {
+                const picked = [];
+                // 1. Native radio groups — group by `name`.
+                const byName = new Map();
+                document.querySelectorAll('input[type="radio"]').forEach(r => {
+                    const k = r.name || '__noname__' + (r.id || Math.random());
+                    if (!byName.has(k)) byName.set(k, []);
+                    byName.get(k).push(r);
+                });
+                for (const [name, group] of byName) {
+                    if (group.some(r => r.checked)) continue;
+                    const first = group[0];
+                    const label = first.id ? document.querySelector('label[for="' + first.id + '"]') : first.closest('label');
+                    const target = label || first;
+                    target.setAttribute('data-nike-radio-pick', picked.length.toString());
+                    picked.push({
+                        kind: 'native',
+                        name,
+                        count: group.length,
+                        text: (label ? (label.innerText||'').trim() : '').slice(0, 60),
+                        id: first.id || '',
+                    });
+                }
+                // 2. ARIA radio groups.
+                document.querySelectorAll('[role="radiogroup"]').forEach(grp => {
+                    const radios = grp.querySelectorAll('[role="radio"]');
+                    if (!radios.length) return;
+                    const anyChecked = [...radios].some(r => r.getAttribute('aria-checked') === 'true');
+                    if (anyChecked) return;
+                    const first = radios[0];
+                    first.setAttribute('data-nike-radio-pick', picked.length.toString());
+                    picked.push({
+                        kind: 'aria',
+                        count: radios.length,
+                        text: (first.innerText||'').trim().slice(0, 60),
+                    });
+                });
+                return picked;
+            }"""
+        )
+        if not info:
+            return 0
+        logger.info("_select_default_option: %d unchecked group(s)", len(info))
+        for i, item in enumerate(info):
+            logger.info("  [%d] %s", i, item)
+        clicked_count = 0
+        for i, item in enumerate(info):
+            try:
+                el = page.locator(f'[data-nike-radio-pick="{i}"]').first
+                try:
+                    await el.scroll_into_view_if_needed(timeout=1500)
+                except Exception:
+                    pass
+                await el.click()
+                clicked_count += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning("  [%d] click failed: %s", i, e)
+        try:
+            await page.evaluate(
+                """() => document.querySelectorAll('[data-nike-radio-pick]').forEach(e => e.removeAttribute('data-nike-radio-pick'))"""
+            )
+        except Exception:
+            pass
+        if clicked_count:
+            logger.info("Clicked %d default option(s)", clicked_count)
+            await asyncio.sleep(1)
+        return clicked_count
+    except Exception as e:
+        logger.debug("_select_default_option failed: %s", e)
+        return 0
+
+
+async def _click_continuar_by_text(page: Page) -> bool:
+    """Last-resort: walk every frame for a visible 'Continuar' element
+    (not 'Continuar comprando') and click it.
+
+    Handles cases where the primary button:
+      - is below the fold
+      - is an <a>/<div role=button>, not a <button>
+      - has unusual class names
+      - is in a nested iframe (Nike's cart summary / payment widgets)
+    """
+    frames = page.frames
+    logger.info("Text-walker searching %d frame(s) for 'Continuar'", len(frames))
+    for i, frame in enumerate(frames):
+        try:
+            cand = await frame.evaluate(_TEXT_WALKER_JS)
+        except Exception as e:
+            logger.debug("  frame[%d] (%s) eval failed: %s", i, frame.url[:60], e)
+            continue
+        if not cand:
+            continue
+        logger.info("  frame[%d] url=%s found %d candidate(s):", i, frame.url[:80], len(cand))
+        for c in cand:
+            logger.info("    %s text=%r testid=%r id=%r size=%dx%d",
+                        c["tag"], c["text"], c["testid"], c["id"], c["width"], c["height"])
+        try:
+            el = frame.locator('[data-nike-bot-target="1"]').first
+            try:
+                await el.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            await el.click()
+            logger.info("Clicked Continuar via text-walker (frame %d)", i)
+            try:
+                await frame.evaluate(
+                    """() => document.querySelectorAll('[data-nike-bot-target]').forEach(e => e.removeAttribute('data-nike-bot-target'))"""
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            logger.warning("  frame[%d] click failed: %s", i, e)
+            continue
+    return False
+
+
+async def _dump_visible_buttons(page: Page, tag: str) -> None:
+    """Log every visible button/link's text — used when stuck to debug."""
+    try:
+        texts = await page.evaluate(
+            """() => {
+                const out = [];
+                const els = document.querySelectorAll('button, a[role="button"], a[href]');
+                for (const el of els) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) continue;
+                    const style = getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    const t = (el.innerText || el.textContent || '').trim().slice(0, 80);
+                    if (!t) continue;
+                    out.push({
+                        tag: el.tagName,
+                        text: t,
+                        href: el.getAttribute('href') || '',
+                        testid: el.getAttribute('data-testid') || '',
+                        disabled: el.hasAttribute('disabled'),
+                        cls: (el.getAttribute('class') || '').slice(0, 80),
+                    });
+                }
+                return out.slice(0, 40);
+            }"""
+        )
+        logger.info("[%s] visible buttons/links (%d):", tag, len(texts))
+        for t in texts:
+            logger.info(
+                "  %s%s text=%r testid=%r href=%r cls=%r",
+                t["tag"], " DISABLED" if t["disabled"] else "",
+                t["text"], t["testid"], t["href"], t["cls"],
+            )
+    except Exception as e:
+        logger.warning("Could not dump buttons (%s): %s", tag, e)
 
 
 async def _select_size(page: Page, size: str) -> bool:
@@ -172,6 +384,88 @@ async def _page_shows_sold_out(page: Page) -> bool:
     return False
 
 
+async def _dismiss_cookie_banner(page: Page) -> bool:
+    """Nike's 'Dados de Navegação' (cookies) banner overlays the checkout
+    and blocks clicks on underlying UI. Click 'Aceitar' if present."""
+    selectors = [
+        'button:has-text("Aceitar"):not([disabled])',
+        'button:has-text("ACEITAR"):not([disabled])',
+        'button:has-text("Aceitar todos"):not([disabled])',
+        'button[aria-label*="Aceitar" i]:not([disabled])',
+        'button[data-testid*="accept" i]:not([disabled])',
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=400):
+                await el.click()
+                logger.info("Dismissed cookie banner via %s", sel)
+                await asyncio.sleep(0.5)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _clear_cart(page: Page) -> None:
+    """Navigate to /carrinho and remove every item so we start fresh."""
+    logger.info("Clearing cart before purchase")
+    try:
+        await page.goto("https://www.nike.com.br/carrinho", wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        logger.warning("Could not load cart for clearing: %s", e)
+        return
+    await asyncio.sleep(2)
+    for _ in range(15):
+        # Find a trash/remove button. Nike uses a small icon button with
+        # aria-label 'Remover produto' or a data-testid containing 'remove'.
+        removed = await page.evaluate(
+            """() => {
+                const sels = [
+                    'button[aria-label*="Remover" i]',
+                    'button[aria-label*="Excluir" i]',
+                    'button[data-testid*="remove" i]',
+                    'button[data-testid*="delete" i]',
+                    'button[data-testid*="trash" i]',
+                ];
+                for (const s of sels) {
+                    const el = document.querySelector(s);
+                    if (el && !el.disabled) {
+                        el.setAttribute('data-nike-trash-target', '1');
+                        return s;
+                    }
+                }
+                return null;
+            }"""
+        )
+        if not removed:
+            logger.info("Cart is empty")
+            return
+        try:
+            el = page.locator('[data-nike-trash-target="1"]').first
+            await el.scroll_into_view_if_needed(timeout=1500)
+            await el.click()
+            logger.info("Removed one cart item (via %s)", removed)
+            await page.evaluate(
+                """() => document.querySelectorAll('[data-nike-trash-target]').forEach(e => e.removeAttribute('data-nike-trash-target'))"""
+            )
+            await asyncio.sleep(1.5)
+            # Confirmation dialog may appear — accept it if "Sim"/"Confirmar".
+            for conf in ['button:has-text("Sim"):not([disabled])', 'button:has-text("Confirmar"):not([disabled])', 'button:has-text("Remover"):not([disabled])']:
+                try:
+                    b = page.locator(conf).first
+                    if await b.is_visible(timeout=600):
+                        await b.click()
+                        logger.info("Confirmed removal via %s", conf)
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning("Remove-item click failed: %s", e)
+            break
+
+
 async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOutcome:
     """Refresh product page until target size is buyable, then purchase."""
     start = time.time()
@@ -184,6 +478,9 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
         cfg.product_url, cfg.product_size, cfg.refresh_interval_ms,
         cfg.max_runtime_minutes, cfg.dry_run,
     )
+
+    # Start clean so we don't end up with N copies from prior runs.
+    await _clear_cart(page)
 
     await page.goto(cfg.product_url, wait_until="domcontentloaded", timeout=60000)
 
@@ -221,14 +518,90 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
 
 
 async def _is_final_pay_step(page: Page) -> bool:
-    """Return True if the page shows a 'final pay / confirm order' button."""
-    for t in FINAL_PAY_TEXTS:
+    """Return True if the page is the final review/pay step — either by
+    URL (/pagamento, /review, /confirmar) or by a visible final-pay button.
+    """
+    url = (page.url or "").lower()
+    if any(h in url for h in FINAL_STEP_URL_HINTS):
+        return True
+    for sel in FINAL_PAY_SELECTORS:
         try:
-            btn = page.locator(f'button:has-text("{t}")').first
-            if await btn.is_visible(timeout=500):
+            if await page.locator(sel).first.is_visible(timeout=300):
                 return True
         except Exception:
             continue
+    return False
+
+
+CVV_INPUT_SELECTORS = [
+    'input[data-testid*="cvv" i]',
+    'input[id*="cvv" i]',
+    'input[name*="cvv" i]',
+    'input[aria-label*="CVV" i]',
+    'input[aria-label*="código de segurança" i]',
+    'input[placeholder*="CVV" i]',
+    'input[placeholder*="código" i][placeholder*="segurança" i]',
+]
+
+
+async def _fill_cvv_if_needed(page: Page, cvv: str) -> bool:
+    """On the payment page, fill the CVV input if one is visible."""
+    if not cvv:
+        return False
+    for sel in CVV_INPUT_SELECTORS:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=400):
+                try:
+                    await el.scroll_into_view_if_needed(timeout=1000)
+                except Exception:
+                    pass
+                await el.click()
+                await el.fill(cvv)
+                logger.info("Filled CVV via %s", sel)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _select_installments(page: Page, preferred: int = 3) -> bool:
+    """Pick a value from the installments (parcelas) dropdown.
+
+    Prefers `preferred` if available, falls back to 1. If no dropdown
+    exists, returns False (not an error).
+    """
+    select_candidates = [
+        'select[data-testid*="parcel" i]',
+        'select[data-testid*="installment" i]',
+        'select[id*="parcel" i]',
+        'select[name*="parcel" i]',
+        'select[aria-label*="parcel" i]',
+    ]
+    for sel in select_candidates:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=400):
+                options = await el.evaluate(
+                    """(s) => [...s.options].map(o => ({
+                        value: o.value, text: (o.innerText || '').trim(), disabled: o.disabled
+                    }))"""
+                )
+                logger.info("Installments options: %s", options)
+                want = [str(preferred), f"{preferred}x", f"{preferred} x"]
+                # Try preferred first, then 1.
+                for val in want + ["1", "1x", "1 x"]:
+                    for o in options:
+                        if o["disabled"]:
+                            continue
+                        if o["value"].strip() == val or o["text"].lower().startswith(val.lower()):
+                            await el.select_option(value=o["value"])
+                            logger.info("Selected installments: %s (text=%r)", o["value"], o["text"])
+                            return True
+        except Exception as e:
+            logger.debug("Installments selector %s failed: %s", sel, e)
+            continue
+    logger.debug("No installments dropdown found")
     return False
 
 
@@ -242,17 +615,72 @@ async def _run_checkout(
     await page.goto("https://www.nike.com.br/carrinho", wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(3)
 
-    MAX_STEPS = 8
+    MAX_STEPS = 12
+    # Content-hash based stuck detector. Nike's /checkout is an SPA with
+    # multiple sections at the same URL — URL and top heading don't change
+    # between steps. We hash the main content's innerText after each
+    # Continuar click; if the hash is unchanged AND we didn't just select
+    # any new radio, treat as stuck and reload.
+    last_content_sig = ""
+    stuck_streak = 0
+    STUCK_RELOAD_THRESHOLD = 3
+
+    async def _content_signature() -> str:
+        try:
+            return await page.evaluate(
+                """() => {
+                    const main = document.querySelector('main') || document.body;
+                    const t = (main.innerText || '').replace(/\\s+/g, ' ').trim();
+                    // Hash via length+slice fingerprint — cheap and good enough.
+                    return t.length + ':' + t.slice(0, 80) + '|' + t.slice(-80);
+                }"""
+            )
+        except Exception:
+            return ""
+
     for step in range(1, MAX_STEPS + 1):
         url = page.url
         logger.info("Checkout step %d — url: %s", step, url)
+
+        # Nike's cookie banner overlays everything and eats clicks.
+        await _dismiss_cookie_banner(page)
 
         if await _is_final_pay_step(page):
             logger.info("Reached final review/pay step at step %d", step)
             break
 
-        if not await _click_first(page, PRIMARY_ACTION_SELECTORS, timeout_ms=8000):
-            logger.error("No Continuar button found at step %d (url=%s)", step, url)
+        # Select defaults for every unselected radio group on the page.
+        selected = await _select_default_option(page)
+
+        cur_sig = await _content_signature()
+        if cur_sig == last_content_sig and selected == 0 and step > 1:
+            stuck_streak += 1
+        else:
+            stuck_streak = 0
+        last_content_sig = cur_sig
+
+        if stuck_streak >= STUCK_RELOAD_THRESHOLD:
+            logger.warning("Content unchanged for %d steps — reloading page", stuck_streak)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.warning("Reload failed: %s", e)
+            stuck_streak = 0
+            continue
+
+        clicked = await _click_first(page, PRIMARY_ACTION_SELECTORS, timeout_ms=5000)
+        if not clicked:
+            clicked = await _click_continuar_by_text(page)
+        if not clicked:
+            logger.info("Step %d: no primary button on first pass, waiting 3s", step)
+            await asyncio.sleep(3)
+            clicked = await _click_first(page, PRIMARY_ACTION_SELECTORS, timeout_ms=8000)
+            if not clicked:
+                clicked = await _click_continuar_by_text(page)
+        if not clicked:
+            logger.error("No primary button found at step %d (url=%s)", step, url)
+            await _dump_visible_buttons(page, f"stuck-step-{step}")
             try:
                 await page.screenshot(path=f"/tmp/nike-checkout-stuck-{step}.png", full_page=True)
             except Exception:
@@ -278,6 +706,54 @@ async def _run_checkout(
             message=f"Walked {MAX_STEPS} steps without reaching final pay",
             attempts=attempts, elapsed_seconds=time.time() - start,
         )
+
+    # Once on the payment/review step, fill CVV and installments (parcelas)
+    # before taking the review screenshot / submitting.
+    import os as _os
+    cvv = _os.environ.get("NIKE_CVV", "").strip()
+    parcelas = int(_os.environ.get("NIKE_PARCELAS", "3") or 3)
+
+    # Clean up any lingering cookie overlay.
+    await _dismiss_cookie_banner(page)
+    await asyncio.sleep(2)
+
+    # Explicitly select the credit card payment method. Nike's /pagamento
+    # renders CVV and parcelas controls only after a method is chosen.
+    try:
+        card_selectors = [
+            'label[for="radio-button-payment-creditCard"]',
+            'label:has-text("Cartão de crédito")',
+            '[data-testid*="credit-card" i]',
+            'input#radio-button-payment-creditCard',
+            'input[id*="creditCard" i]',
+        ]
+        for sel in card_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=500):
+                    await el.scroll_into_view_if_needed(timeout=1500)
+                    await el.click()
+                    logger.info("Selected credit card via %s", sel)
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("Credit-card selection failed: %s", e)
+
+    await asyncio.sleep(2)
+
+    if cvv:
+        filled = await _fill_cvv_if_needed(page, cvv)
+        if not filled:
+            logger.info("CVV input not found (card may be saved with CVV already)")
+    else:
+        logger.info("NIKE_CVV not set — skipping CVV fill")
+
+    picked = await _select_installments(page, preferred=parcelas)
+    if not picked:
+        logger.info("Installments select not found — leaving default")
+
+    await asyncio.sleep(1)
 
     try:
         await page.screenshot(path="/tmp/nike-checkout-review.png", full_page=True)

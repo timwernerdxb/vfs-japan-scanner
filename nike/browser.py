@@ -23,23 +23,22 @@ logger = logging.getLogger("nike.browser")
 async def browser_context(cfg: NikeConfig):
     """Yield a (browser, context, page) tuple.
 
-    Two modes:
+    Modes (checked in order):
 
-    1. CDP mode (NIKE_CDP_URL set): connect to an existing Chrome instance
-       the user launched manually. This bypasses most bot-detection because
-       the browser wasn't spawned by Playwright. Launch Chrome like this
-       first:
-
-         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \\
-             --remote-debugging-port=9222 \\
-             --user-data-dir=/tmp/chrome-nike-profile
-
+    1. CDP mode (NIKE_CDP_URL set): connect to an existing Chrome the user
+       launched manually. Launch Chrome first:
+         Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome
        Then set NIKE_CDP_URL=http://localhost:9222.
 
-    2. Launch mode (default): Patchright launches Chrome with
-       launch_persistent_context (no custom args, channel="chrome" if real
-       Chrome is installed). Falls back to bundled Chromium otherwise.
+    2. Storage-state mode (NIKE_STORAGE_STATE_JSON or NIKE_STORAGE_STATE
+       file exists): launch chromium NON-persistently and inject cookies +
+       localStorage. Used for headless runs on Railway where there's no
+       browser UI available for manual login.
+
+    3. Launch mode (default): Patchright launch_persistent_context with
+       real Chrome (channel="chrome") → bundled Chromium fallback.
     """
+    import json
     cdp_url = os.environ.get("NIKE_CDP_URL", "").strip()
 
     async with async_playwright() as pw:
@@ -60,6 +59,47 @@ async def browser_context(cfg: NikeConfig):
             finally:
                 # Don't close the user's browser; just disconnect.
                 await browser.close()
+            return
+
+        storage_json = os.environ.get("NIKE_STORAGE_STATE_JSON", "").strip()
+        storage_path = os.environ.get("NIKE_STORAGE_STATE", "").strip()
+        if storage_json or (storage_path and os.path.exists(storage_path)):
+            if storage_json:
+                storage = json.loads(storage_json)
+                logger.info(
+                    "Using NIKE_STORAGE_STATE_JSON (%d cookies)",
+                    len(storage.get("cookies", [])),
+                )
+            else:
+                with open(storage_path) as f:
+                    storage = json.load(f)
+                logger.info("Using storage state from %s", storage_path)
+            browser = await pw.chromium.launch(
+                channel=os.environ.get("NIKE_BROWSER_CHANNEL", "chrome"),
+                headless=cfg.headless,
+                args=["--no-sandbox", "--disable-dev-shm-usage"] if cfg.headless else [],
+            ) if False else None
+            # Patchright's stealth is weaker with non-persistent launches,
+            # so prefer launch_persistent_context even here — we just
+            # preload cookies via add_cookies after launch.
+            user_data_dir = os.environ.get("NIKE_USER_DATA_DIR", "/tmp/nike-user-data")
+            os.makedirs(user_data_dir, exist_ok=True)
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel=os.environ.get("NIKE_BROWSER_CHANNEL", "chrome"),
+                headless=cfg.headless,
+                no_viewport=True,
+                locale="pt-BR",
+                timezone_id=cfg.timezone,
+            )
+            if storage.get("cookies"):
+                await context.add_cookies(storage["cookies"])
+                logger.info("Injected %d cookies", len(storage["cookies"]))
+            page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                yield None, context, page
+            finally:
+                await context.close()
             return
 
         user_data_dir = os.environ.get(
