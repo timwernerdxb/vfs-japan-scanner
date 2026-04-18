@@ -24,16 +24,43 @@ from nike.config import NikeConfig
 logger = logging.getLogger("nike.purchase")
 
 
+# SNKRS drops rotate the CTA text and disabled state is often a grey
+# "Disponível em DD/MM" / "Esgotado" / "Notificar-me". We filter those out
+# via NEGATIVE_TEXTS and rely on `:not([disabled])` + a visible test.
 ADD_TO_CART_SELECTORS = [
-    'button:has-text("ADICIONAR AO CARRINHO")',
-    'button:has-text("Adicionar ao carrinho")',
-    'button:has-text("COMPRAR")',
-    'button:has-text("Comprar")',
-    'button:has-text("ADICIONAR À SACOLA")',
-    'button:has-text("Adicionar à sacola")',
-    'button[data-testid="add-to-cart"]',
-    'button[data-testid="buy-cta"]',
+    'button[data-testid="add-to-cart"]:not([disabled])',
+    'button[data-testid="buy-cta"]:not([disabled])',
+    'button[data-testid*="buy" i]:not([disabled])',
+    'button[data-testid*="purchase" i]:not([disabled])',
+    'button[data-testid*="cart" i]:not([disabled])',
+    'button:has-text("ADICIONAR AO CARRINHO"):not([disabled])',
+    'button:has-text("Adicionar ao carrinho"):not([disabled])',
+    'button:has-text("ADICIONAR À SACOLA"):not([disabled])',
+    'button:has-text("Adicionar à sacola"):not([disabled])',
+    'button:has-text("Comprar agora"):not([disabled])',
+    'button:has-text("COMPRAR AGORA"):not([disabled])',
+    'button:has-text("Comprar"):not([disabled])',
+    'button:has-text("COMPRAR"):not([disabled])',
+    'button:has-text("Garanta o seu"):not([disabled])',
+    'button:has-text("GARANTA O SEU"):not([disabled])',
+    'button:has-text("Garantir"):not([disabled])',
+    'button:has-text("Eu quero"):not([disabled])',
 ]
+
+# Countdown / pre-drop / sold-out states — do NOT click these even if
+# they technically pass the "primary action" selectors.
+UNAVAILABLE_BUTTON_TEXTS = (
+    "disponível em",      # e.g. "Disponível em 20/04"
+    "disponivel em",
+    "notificar-me",
+    "notifique-me",
+    "avise-me",
+    "esgotado",
+    "indisponível",
+    "indisponivel",
+    "em breve",
+    "ver produto",
+)
 
 GO_TO_BAG_SELECTORS = [
     'a[href*="/carrinho"]',
@@ -130,6 +157,12 @@ async def _click_first(page: Page, selectors: list[str], timeout_ms: int = 5000)
                         logger.debug(
                             "Skipping match %d of %s (text=%r, negative)",
                             i, sel, text,
+                        )
+                        continue
+                    if any(u in text for u in UNAVAILABLE_BUTTON_TEXTS):
+                        logger.info(
+                            "Skipping unavailable CTA %s [%d] text=%r",
+                            sel, i, text,
                         )
                         continue
                     try:

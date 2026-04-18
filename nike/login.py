@@ -80,12 +80,17 @@ async def is_logged_in(context: BrowserContext, page: Page | None = None) -> boo
                     return True
             except Exception:
                 continue
-        # Look for anonymous-user CTAs.
+        # Strong anonymous-user signals — Nike's *site-wide* footer has
+        # "Cadastre-se" so we can't rely on that. Use only login-modal
+        # / login-page indicators that are unique to the anon account UX.
         anon_signals = [
             'text=/Fazer login/i',
             'text=/Entrar com senha/i',
-            'button:has-text("Entrar")',
-            'a:has-text("Cadastre-se")',
+            'text=/Ainda não tem conta/i',
+            'text=/Acesse sua conta/i',
+            'text=/Inicie a sessão/i',
+            'h1:has-text("Entrar")',
+            'h2:has-text("Entrar")',
         ]
         for sel in anon_signals:
             try:
