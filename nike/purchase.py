@@ -375,6 +375,9 @@ async def _dump_visible_buttons(page: Page, tag: str) -> None:
         logger.warning("Could not dump buttons (%s): %s", tag, e)
 
 
+_SIZE_DEBUG_DUMPED = False
+
+
 async def _select_size(page: Page, size: str) -> bool:
     """Try several shapes of size-picker UIs.
 
@@ -384,6 +387,7 @@ async def _select_size(page: Page, size: str) -> bool:
     candidates = [
         f'label:has-text("{size}"):not([aria-disabled="true"])',
         f'button:has-text("{size}"):not([disabled])',
+        f'label[data-testid*="size" i]:has-text("{size}")',
         f'[data-testid="size-{size}"]',
         f'input[value="{size}"]',
     ]
@@ -403,6 +407,33 @@ async def _select_size(page: Page, size: str) -> bool:
             continue
         except Exception as e:
             logger.debug("Size selector %s failed: %s", sel, e)
+
+    # First-time miss — dump what IS on the page to help debug.
+    global _SIZE_DEBUG_DUMPED
+    if not _SIZE_DEBUG_DUMPED:
+        _SIZE_DEBUG_DUMPED = True
+        try:
+            info = await page.evaluate(
+                """() => {
+                    const out = {
+                        title: document.title.slice(0, 120),
+                        url: location.href,
+                        hasProductGrid: !!document.querySelector('[data-testid*="size" i], [class*="size-grid" i], fieldset'),
+                        labels: [...document.querySelectorAll('label')].slice(0, 30).map(l => ({text: (l.innerText||'').trim().slice(0,40), cls: (l.getAttribute('class')||'').slice(0, 50)})),
+                        buttons_with_sizes: [...document.querySelectorAll('button')].filter(b => /^\\s*(\\d{1,2}(\\.\\d)?|P|M|G|GG|XG|XXG|XP|U)\\s*$/i.test((b.innerText||'').trim())).map(b => (b.innerText||'').trim()),
+                        body_sample: (document.body.innerText || '').slice(0, 400),
+                    };
+                    return out;
+                }"""
+            )
+            logger.info("[size-debug] title=%r url=%s", info.get("title"), info.get("url"))
+            logger.info("[size-debug] hasProductGrid=%s", info.get("hasProductGrid"))
+            logger.info("[size-debug] labels (first 30): %s", info.get("labels"))
+            logger.info("[size-debug] button sizes: %s", info.get("buttons_with_sizes"))
+            logger.info("[size-debug] body[:400]=%r", info.get("body_sample"))
+            await page.screenshot(path="/tmp/nike-size-debug.png", full_page=False)
+        except Exception as e:
+            logger.warning("size-debug dump failed: %s", e)
     return False
 
 
