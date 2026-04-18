@@ -24,6 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy application code
 COPY . .
 
-# For the Nike bot: auto-start Xvfb and run headful Chrome (NIKE_HEADLESS=false).
+# For the Nike bot: wrap with xvfb-run so Chrome gets a virtual display.
 # For VFS (BOT != nike): run as before, no display needed.
-CMD ["/bin/sh", "-c", "if [ \"$BOT\" = nike ]; then export DISPLAY=:99 && Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & sleep 1 && exec python nike_main.py; else exec python main.py; fi"]
+CMD ["/bin/sh", "-c", "if [ \"$BOT\" = nike ]; then exec xvfb-run -a --server-args='-screen 0 1280x800x24' python nike_main.py; else exec python main.py; fi"]
