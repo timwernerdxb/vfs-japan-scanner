@@ -466,6 +466,116 @@ async def _clear_cart(page: Page) -> None:
             break
 
 
+async def _find_product_via_search(page: Page, query: str, deadline: float) -> bool:
+    """Use Nike's search box to locate a product by name. Clicks the first
+    non-ad product tile. Retries until `deadline` (epoch seconds) in case
+    the product isn't indexed yet (e.g. running before a drop).
+
+    Returns True when a product tile has been clicked and we're on its PDP.
+    """
+    logger.info("Searching nike.com.br for %r", query)
+    while time.time() < deadline:
+        try:
+            await page.goto("https://www.nike.com.br/", wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            logger.warning("Could not load homepage for search: %s", e)
+            await asyncio.sleep(2)
+            continue
+
+        search_input_selectors = [
+            'input[data-testid*="search" i]',
+            'input[placeholder*="Busca" i]',
+            'input[placeholder*="buscar" i]',
+            'input[name*="search" i]',
+            'input[type="search"]',
+            'input[aria-label*="Busca" i]',
+        ]
+        input_el = None
+        for sel in search_input_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=1200):
+                    input_el = el
+                    break
+            except Exception:
+                continue
+        if input_el is None:
+            # Nike sometimes hides the search box behind a magnifier icon —
+            # click the first visible icon with aria-label="Buscar".
+            for sel in ['button[aria-label*="Busca" i]', '[data-testid*="search-toggle" i]']:
+                try:
+                    b = page.locator(sel).first
+                    if await b.is_visible(timeout=800):
+                        await b.click()
+                        await asyncio.sleep(0.5)
+                        break
+                except Exception:
+                    continue
+            for sel in search_input_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1200):
+                        input_el = el
+                        break
+                except Exception:
+                    continue
+        if input_el is None:
+            logger.warning("Could not find search input; falling back to /busca URL")
+            import urllib.parse as _u
+            try:
+                await page.goto(
+                    f"https://www.nike.com.br/busca?query={_u.quote(query)}",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            except Exception as e:
+                logger.warning("Fallback /busca failed: %s", e)
+                await asyncio.sleep(2)
+                continue
+        else:
+            try:
+                await input_el.fill("")
+                await input_el.fill(query)
+                await input_el.press("Enter")
+            except Exception as e:
+                logger.warning("Search input fill failed: %s", e)
+                continue
+        await asyncio.sleep(2)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeout:
+            pass
+
+        # Click the first product tile.
+        tile_selectors = [
+            'a[data-testid*="product-card" i][href*="/"]',
+            'a[data-testid*="product-link" i]',
+            'a[data-testid*="produto" i]',
+            'a.ProductCard[href*="/"]',
+            'a[href*="/"][href*=".html"]',
+        ]
+        for sel in tile_selectors:
+            try:
+                tile = page.locator(sel).first
+                if await tile.is_visible(timeout=1500):
+                    href = await tile.get_attribute("href")
+                    logger.info("Clicking first search result (%s): %s", sel, href)
+                    await tile.scroll_into_view_if_needed(timeout=2000)
+                    await tile.click()
+                    await asyncio.sleep(2)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except PlaywrightTimeout:
+                        pass
+                    return True
+            except Exception as e:
+                logger.debug("Tile %s failed: %s", sel, e)
+                continue
+        logger.info("No product tiles found for %r — retrying in 5s", query)
+        await asyncio.sleep(5)
+    return False
+
+
 async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOutcome:
     """Refresh product page until target size is buyable, then purchase."""
     start = time.time()
@@ -473,16 +583,26 @@ async def wait_for_available_and_buy(page: Page, cfg: NikeConfig) -> PurchaseOut
     interval = cfg.refresh_interval_ms / 1000.0
     attempts = 0
 
+    target_desc = cfg.product_url or f"search={cfg.search_query!r}"
     logger.info(
         "Polling %s for size %s (refresh every %sms, max %sm, dry_run=%s)",
-        cfg.product_url, cfg.product_size, cfg.refresh_interval_ms,
+        target_desc, cfg.product_size, cfg.refresh_interval_ms,
         cfg.max_runtime_minutes, cfg.dry_run,
     )
 
     # Start clean so we don't end up with N copies from prior runs.
     await _clear_cart(page)
 
-    await page.goto(cfg.product_url, wait_until="domcontentloaded", timeout=60000)
+    if cfg.product_url:
+        await page.goto(cfg.product_url, wait_until="domcontentloaded", timeout=60000)
+    else:
+        ok = await _find_product_via_search(page, cfg.search_query, deadline)
+        if not ok:
+            return PurchaseOutcome(
+                success=False, stage="search",
+                message=f"Could not find {cfg.search_query!r} via search before deadline",
+                attempts=0, elapsed_seconds=time.time() - start,
+            )
 
     while time.time() < deadline:
         attempts += 1

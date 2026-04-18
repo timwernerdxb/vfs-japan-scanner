@@ -41,6 +41,7 @@ class NikeConfig:
     email: str
     password: str
     product_url: str
+    search_query: str
     product_size: str
     drop_time: datetime | None
     timezone: str
@@ -69,9 +70,9 @@ class NikeConfig:
             errors.append("NIKE_EMAIL is required")
         if not self.password:
             errors.append("NIKE_PASSWORD is required")
-        if not self.product_url:
-            errors.append("NIKE_PRODUCT_URL is required")
-        if not self.product_url.startswith("https://www.nike.com.br"):
+        if not self.product_url and not self.search_query:
+            errors.append("Either NIKE_PRODUCT_URL or NIKE_SEARCH_QUERY is required")
+        if self.product_url and not self.product_url.startswith("https://www.nike.com.br"):
             errors.append("NIKE_PRODUCT_URL must be on https://www.nike.com.br")
         if not self.product_size:
             errors.append("NIKE_PRODUCT_SIZE is required (e.g. '42', '10.5')")
@@ -88,6 +89,7 @@ def load_config() -> NikeConfig:
         email=_env("NIKE_EMAIL"),
         password=_env("NIKE_PASSWORD"),
         product_url=_env("NIKE_PRODUCT_URL"),
+        search_query=_env("NIKE_SEARCH_QUERY"),
         product_size=_env("NIKE_PRODUCT_SIZE"),
         drop_time=drop_time,
         timezone=_env("NIKE_TIMEZONE", "America/Sao_Paulo"),
