@@ -14,9 +14,16 @@ RUN patchright install --with-deps chromium
 # block that was returning Akamai 'Access Denied' on Railway.
 RUN patchright install --with-deps chrome
 
+# Xvfb (virtual display) so Chrome can run HEADFUL on Railway. Akamai
+# keys off the headless=true flag — headful + Xvfb makes the browser
+# look much closer to a real user session.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb xauth \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy application code
 COPY . .
 
-# Dispatch on an explicit BOT env var (set per Railway service) so one
-# image powers both services. BOT=nike -> Nike purchase bot; else VFS.
-CMD ["/bin/sh", "-c", "if [ \"$BOT\" = nike ]; then exec python nike_main.py; else exec python main.py; fi"]
+# For the Nike bot: auto-start Xvfb and run headful Chrome (NIKE_HEADLESS=false).
+# For VFS (BOT != nike): run as before, no display needed.
+CMD ["/bin/sh", "-c", "if [ \"$BOT\" = nike ]; then export DISPLAY=:99 && Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & sleep 1 && exec python nike_main.py; else exec python main.py; fi"]
