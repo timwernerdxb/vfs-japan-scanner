@@ -12,6 +12,6 @@ RUN patchright install --with-deps chromium
 # Copy application code
 COPY . .
 
-# Dispatch on Railway service name so the same image powers both services.
-# Railway sets RAILWAY_SERVICE_NAME automatically; locally defaults to VFS.
-CMD ["/bin/sh", "-c", "if [ \"$RAILWAY_SERVICE_NAME\" = nike-bot ]; then exec python nike_main.py; else exec python main.py; fi"]
+# Dispatch on an explicit BOT env var (set per Railway service) so one
+# image powers both services. BOT=nike -> Nike purchase bot; else VFS.
+CMD ["/bin/sh", "-c", "if [ \"$BOT\" = nike ]; then exec python nike_main.py; else exec python main.py; fi"]
