@@ -87,6 +87,17 @@ async def browser_context(cfg: NikeConfig):
                 locale="pt-BR",
                 timezone_id=cfg.timezone,
             )
+            proxy_server = os.environ.get("NIKE_PROXY_SERVER", "").strip()
+            if proxy_server:
+                proxy_cfg = {"server": proxy_server}
+                pu = os.environ.get("NIKE_PROXY_USERNAME", "").strip()
+                pp = os.environ.get("NIKE_PROXY_PASSWORD", "").strip()
+                if pu:
+                    proxy_cfg["username"] = pu
+                if pp:
+                    proxy_cfg["password"] = pp
+                launch_kwargs["proxy"] = proxy_cfg
+                logger.info("Using proxy %s (user=%s)", proxy_server, pu or "(none)")
             try:
                 context = await pw.chromium.launch_persistent_context(
                     channel=channel, **launch_kwargs,
