@@ -74,24 +74,29 @@ async def browser_context(cfg: NikeConfig):
                 with open(storage_path) as f:
                     storage = json.load(f)
                 logger.info("Using storage state from %s", storage_path)
-            browser = await pw.chromium.launch(
-                channel=os.environ.get("NIKE_BROWSER_CHANNEL", "chrome"),
-                headless=cfg.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage"] if cfg.headless else [],
-            ) if False else None
             # Patchright's stealth is weaker with non-persistent launches,
             # so prefer launch_persistent_context even here — we just
             # preload cookies via add_cookies after launch.
             user_data_dir = os.environ.get("NIKE_USER_DATA_DIR", "/tmp/nike-user-data")
             os.makedirs(user_data_dir, exist_ok=True)
-            context = await pw.chromium.launch_persistent_context(
+            channel = os.environ.get("NIKE_BROWSER_CHANNEL", "chrome")
+            launch_kwargs = dict(
                 user_data_dir=user_data_dir,
-                channel=os.environ.get("NIKE_BROWSER_CHANNEL", "chrome"),
                 headless=cfg.headless,
                 no_viewport=True,
                 locale="pt-BR",
                 timezone_id=cfg.timezone,
             )
+            try:
+                context = await pw.chromium.launch_persistent_context(
+                    channel=channel, **launch_kwargs,
+                )
+            except Exception as e:
+                logger.warning(
+                    "channel=%s unavailable (%s) — falling back to bundled chromium",
+                    channel, e,
+                )
+                context = await pw.chromium.launch_persistent_context(**launch_kwargs)
             if storage.get("cookies"):
                 await context.add_cookies(storage["cookies"])
                 logger.info("Injected %d cookies", len(storage["cookies"]))
