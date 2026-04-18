@@ -9,6 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Patchright Chromium + system deps (stealth Playwright fork)
 RUN patchright install --with-deps chromium
 
+# Install REAL Google Chrome — Akamai fingerprints bundled Chromium and
+# blocks it even with stealth patches. Real Chrome gets past the Layer-4
+# block that was returning Akamai 'Access Denied' on Railway.
+RUN patchright install --with-deps chrome
+
 # Copy application code
 COPY . .
 
