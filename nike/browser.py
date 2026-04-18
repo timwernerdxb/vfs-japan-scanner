@@ -83,9 +83,18 @@ async def browser_context(cfg: NikeConfig):
             launch_kwargs = dict(
                 user_data_dir=user_data_dir,
                 headless=cfg.headless,
-                no_viewport=True,
                 locale="pt-BR",
                 timezone_id=cfg.timezone,
+                viewport={"width": 1280, "height": 800},
+                user_agent=cfg.user_agent,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-infobars",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                ],
             )
             proxy_server = os.environ.get("NIKE_PROXY_SERVER", "").strip()
             if proxy_server:
