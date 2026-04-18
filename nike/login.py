@@ -53,8 +53,10 @@ async def is_logged_in(context: BrowserContext, page: Page | None = None) -> boo
             wait_until="domcontentloaded",
             timeout=20000,
         )
-        # Give the SPA a moment to render its auth-gated UI.
-        await asyncio.sleep(2)
+        # Give the SPA a moment to render its auth-gated UI. On slow/
+        # bot-suspicious environments (Railway data-center IP) the page
+        # may take longer to hydrate — wait up to 5s.
+        await asyncio.sleep(5)
         final = page.url.lower()
         if "login" in final or "signin" in final:
             logger.info("Account page redirected to login (%s) — not logged in", final)
@@ -100,6 +102,16 @@ async def is_logged_in(context: BrowserContext, page: Page | None = None) -> boo
             except Exception:
                 continue
         logger.info("Probe unclear at %s — treating as NOT logged in", final)
+        try:
+            title = (await page.title())[:120]
+            body = await page.evaluate(
+                "() => (document.body && document.body.innerText || '').trim().slice(0, 400)"
+            )
+            logger.info("Probe page title=%r body[:400]=%r", title, body)
+            await page.screenshot(path="/tmp/nike-login-probe.png", full_page=False)
+            logger.info("Screenshot saved to /tmp/nike-login-probe.png")
+        except Exception as ee:
+            logger.debug("Probe debug dump failed: %s", ee)
         return False
     except Exception as e:
         logger.warning("is_logged_in probe failed (%s) — assuming NOT logged in", e)
