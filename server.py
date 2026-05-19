@@ -18,6 +18,10 @@ Env vars required:
   PROXY_* — residential proxy for login (see scanner/auto_login.py)
 """
 
+import sys
+print("[server.py] import starting", flush=True)
+sys.stdout.flush()
+
 import asyncio
 import hmac
 import json
@@ -27,7 +31,10 @@ import time
 from datetime import datetime
 from typing import Optional
 
+print("[server.py] stdlib imports OK", flush=True)
+
 from starlette.applications import Starlette
+print("[server.py] starlette import OK", flush=True)
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -35,7 +42,9 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 from scanner.auto_login import auto_login
+print("[server.py] auto_login import OK", flush=True)
 from scanner.vfs_checker import check_slot
+print("[server.py] vfs_checker import OK", flush=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -234,6 +243,7 @@ routes = [
 ]
 
 app = Starlette(debug=False, routes=routes)
+print("[server.py] app built; ready for ASGI", flush=True)
 
 
 if __name__ == "__main__":
