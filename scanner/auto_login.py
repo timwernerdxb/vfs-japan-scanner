@@ -417,24 +417,28 @@ async def _do_login() -> dict:
                 "--disable-renderer-backgrounding",
             ],
         )
-        # Configure proxy via local auth-injecting forwarder
-        # Chromium doesn't send Proxy-Authorization proactively — some proxies
-        # reject without a 407 challenge. Our local proxy fixes this.
+        # Patchright handles proxy auth natively via the launch proxy={}
+        # dict. The previous local auth-injecting forwarder broke on
+        # Patchright's synthetic *.internal CONNECT requests, so swapping
+        # to native proxy support (no forwarder in the path).
         if PROXY_ENABLED and PROXY_SERVER:
             host = PROXY_SERVER.split("://")[-1].split(":")[0]
             port_str = PROXY_SERVER.split(":")[-1]
             port = int(port_str) if port_str.isdigit() else 20004
-            local_port = _start_auth_proxy(host, port, PROXY_USER, PROXY_PASS)
-            launch_opts["proxy"] = {"server": f"http://127.0.0.1:{local_port}"}
-            logger.info("Proxy via local forwarder :%d -> %s:%d (user: %s)", local_port, host, port, PROXY_USER or "none")
+            proxy_cfg = {"server": f"http://{host}:{port}"}
+            if PROXY_USER:
+                proxy_cfg["username"] = PROXY_USER
+                proxy_cfg["password"] = PROXY_PASS
+            launch_opts["proxy"] = proxy_cfg
+            logger.info("Proxy native: %s:%d (user=%s)", host, port, PROXY_USER or "none")
         elif PROXY_ENABLED and PROXY_URL:
             parsed = urlparse(PROXY_URL)
-            local_port = _start_auth_proxy(
-                parsed.hostname, parsed.port or 20004,
-                parsed.username or "", parsed.password or "",
-            )
-            launch_opts["proxy"] = {"server": f"http://127.0.0.1:{local_port}"}
-            logger.info("Proxy via local forwarder :%d -> %s:%s", local_port, parsed.hostname, parsed.port)
+            proxy_cfg = {"server": f"http://{parsed.hostname}:{parsed.port or 20004}"}
+            if parsed.username:
+                proxy_cfg["username"] = parsed.username
+                proxy_cfg["password"] = parsed.password or ""
+            launch_opts["proxy"] = proxy_cfg
+            logger.info("Proxy native: %s:%s (user=%s)", parsed.hostname, parsed.port, parsed.username or "none")
         browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
