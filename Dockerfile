@@ -12,4 +12,8 @@ RUN patchright install --with-deps chromium
 # Copy application code
 COPY . .
 
-CMD ["python", "main.py"]
+# Railway injects PORT at runtime.
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}"]
