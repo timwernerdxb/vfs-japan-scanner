@@ -24,6 +24,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy application code
 COPY . .
 
-# For the Nike bot: wrap with xvfb-run so Chrome gets a virtual display.
-# For VFS (BOT != nike): run as before, no display needed.
-CMD ["/bin/sh", "-c", "if [ \"$BOT\" = nike ]; then Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & export DISPLAY=:99 PYTHONUNBUFFERED=1; sleep 2; exec python -u nike_main.py; else exec python main.py; fi"]
+# Railway injects PORT at runtime (only meaningful for the HTTP server mode).
+ENV PORT=8080
+EXPOSE 8080
+
+# Three dispatch modes, selected via BOT env var:
+#   BOT=nike   -> Nike purchase bot (headful Chrome under Xvfb)
+#   BOT=worker -> long-running VFS scanner (scanner.main)
+#   else       -> VFS HTTP API server (uvicorn), the default
+CMD ["/bin/sh", "-c", "\
+if [ \"$BOT\" = nike ]; then \
+    Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & \
+    export DISPLAY=:99 PYTHONUNBUFFERED=1; \
+    sleep 2; \
+    exec python -u nike_main.py; \
+elif [ \"$BOT\" = worker ]; then \
+    exec python main.py; \
+else \
+    echo '[boot] starting uvicorn on port '${PORT:-8080}; \
+    exec python -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080} --log-level info; \
+fi"]
