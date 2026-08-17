@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from patchright.async_api import async_playwright
 
-from scanner.captcha_solver import solve_turnstile
+from scanner.captcha_solver import solve_turnstile, solve_hcaptcha
 
 VFS_LOGIN_URL = "https://visa.vfsglobal.com/are/en/prt/login"
 
@@ -44,22 +44,38 @@ VFS_LOGIN_URLS = [
 ]
 
 
-def _direct_api_login(captcha_token: str) -> dict | None:
+def _direct_api_login(captcha_token: str, hcaptcha_token: str = "") -> dict | None:
     """Try to login via direct Python HTTP POST (bypasses browser + proxy).
 
     Returns parsed JSON response dict on success, or None on failure.
     Tries multiple known login endpoint URLs.
+
+    Args:
+        captcha_token: Cloudflare Turnstile response token.
+        hcaptcha_token: Optional hCaptcha response token. Added to the body
+            under several field names since we don't yet know which one
+            VFS's updated API expects (added late June 2026).
     """
     import json as json_mod
     import urllib.request
     import urllib.error
 
-    login_body = json_mod.dumps({
+    body_dict = {
         "username": VFS_EMAIL,
         "password": VFS_PASSWORD,
         "captcha_api_key": captcha_token,
         "captcha_version": "Turnstile",
-    }).encode("utf-8")
+    }
+    if hcaptcha_token:
+        # Try every plausible field name — VFS's API surface is undocumented
+        # and it's cheaper to send extras than to lose the login on a miss.
+        body_dict.update({
+            "hcaptcha_token": hcaptcha_token,
+            "hcaptcha_api_key": hcaptcha_token,
+            "h_captcha_response": hcaptcha_token,
+            "hcaptchaResponse": hcaptcha_token,
+        })
+    login_body = json_mod.dumps(body_dict).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",
@@ -179,6 +195,137 @@ async def _inject_turnstile_token(page, token: str):
         }
     """, token)
     logger.info("Turnstile token injected")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# hCaptcha (VFS UAE added this on top of Cloudflare Turnstile in late
+# June 2026). Detection + inject helpers mirror the Turnstile ones but
+# target the hCaptcha widget contract:
+#   - hidden textarea `[name="h-captcha-response"]`
+#   - global callbacks registered via `hcaptcha.render({callback})`
+#   - iframe `src` contains `hcaptcha.com` / `newassets.hcaptcha.com`
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def _extract_hcaptcha_sitekey(page) -> str:
+    """Return the hCaptcha sitekey on the page, or "" if no widget present."""
+    sitekey = await page.evaluate("""
+        () => {
+            const el = document.querySelector('.h-captcha[data-sitekey], [data-hcaptcha-sitekey]');
+            if (el) {
+                return el.getAttribute('data-sitekey') || el.getAttribute('data-hcaptcha-sitekey');
+            }
+            const iframe = document.querySelector('iframe[src*="hcaptcha.com"]');
+            if (iframe) {
+                const m = iframe.src.match(/sitekey=([^&]+)/);
+                if (m) return m[1];
+            }
+            const scripts = document.querySelectorAll('script');
+            for (const s of scripts) {
+                if (!s.textContent) continue;
+                const m = s.textContent.match(
+                    /(?:hcaptcha|h-captcha)[^{]*?sitekey['"]?\\s*[:=]\\s*['"]([0-9a-f-]{20,})['"]/i
+                );
+                if (m) return m[1];
+            }
+            return '';
+        }
+    """)
+    if not sitekey:
+        sitekey = (os.environ.get("VFS_HCAPTCHA_SITEKEY", "") or "").strip()
+    if sitekey:
+        logger.info("Found hCaptcha sitekey: %s...", sitekey[:12])
+    else:
+        logger.info("No hCaptcha widget detected on page")
+    return sitekey
+
+
+async def _inject_hcaptcha_token(page, token: str) -> dict:
+    """Inject a solved hCaptcha token into the page.
+
+    Applied in three places (belt-and-suspenders — Angular / vendor scripts
+    read from different ones):
+      1. Hidden textarea `[name="h-captcha-response"]` (also `g-recaptcha-response`
+         which older widgets alias) + fire input/change events.
+      2. `window.__hcaptchaToken` for anything polling globally.
+      3. Any registered hCaptcha widget callback via `hcaptcha.execute` /
+         reflection on `window.hcaptcha` if the vendor script loaded.
+      4. Angular reactive-form controls whose name matches /hcaptcha/i.
+    """
+    result = await page.evaluate("""
+        (token) => {
+            const r = {};
+            window.__hcaptchaToken = token;
+
+            const selectors = [
+                'textarea[name="h-captcha-response"]',
+                'textarea[name="g-recaptcha-response"]',
+                'input[name="h-captcha-response"]',
+                'input[name="hcaptcha-response"]',
+                'input[name="hcaptchaResponse"]',
+                'input[name="captcha_api_key"]',
+            ];
+            r.filled = [];
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach(el => {
+                    el.value = token;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    r.filled.push(sel);
+                });
+            }
+
+            r.callbacks = [];
+            const cbNames = [
+                'onHcaptchaSuccess', 'onHcaptchaVerify', 'onHCaptchaSuccess',
+                'onHCaptchaVerify', 'hcaptchaCallback', '__hcaptchaCallback',
+            ];
+            for (const n of cbNames) {
+                if (typeof window[n] === 'function') {
+                    try { window[n](token); r.callbacks.push(n); } catch(e) {}
+                }
+            }
+
+            if (window.hcaptcha) {
+                r.hcaptcha_object = true;
+                try {
+                    const containers = document.querySelectorAll(
+                        '[data-hcaptcha-widget-id]');
+                    r.widget_ids = [...containers].map(
+                        c => c.getAttribute('data-hcaptcha-widget-id'));
+                } catch(e) { r.widget_err = e.message; }
+            }
+
+            const allEls = document.querySelectorAll('*');
+            let patched = 0;
+            for (let i = 0; i < allEls.length && patched < 3; i++) {
+                const ctx = allEls[i].__ngContext__;
+                if (!Array.isArray(ctx)) continue;
+                for (let j = 0; j < ctx.length && j < 300; j++) {
+                    try {
+                        const item = ctx[j];
+                        if (!item || typeof item !== 'object' || !item.controls) continue;
+                        const controlNames = Object.keys(item.controls);
+                        for (const cn of controlNames) {
+                            if (/hcaptcha|captcha_api_key/i.test(cn)) {
+                                item.controls[cn].setValue(token);
+                                patched++;
+                                r['patched_' + cn] = true;
+                            }
+                        }
+                        if (patched) {
+                            item.updateValueAndValidity();
+                            r.fg_status = item.status;
+                        }
+                    } catch(e) { /* skip */ }
+                }
+            }
+            r.fg_patched = patched;
+            return r;
+        }
+    """, token)
+    logger.info("hCaptcha token injected: %s", result)
+    return result
 
 
 async def _log_page_debug(page, label="debug"):
@@ -1485,9 +1632,30 @@ async def _do_login() -> dict:
                     token = solve_turnstile(VFS_LOGIN_URL, sitekey)
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
+                    # ── hCaptcha (added by VFS UAE in late June 2026) ──
+                    # If a widget is present on the page, solve + inject in
+                    # the same manner as Turnstile. Held in `hcaptcha_token`
+                    # for use by _direct_api_login and the route interceptor.
+                    hcaptcha_token = ""
+                    try:
+                        hcap_sitekey = await _extract_hcaptcha_sitekey(page)
+                        if hcap_sitekey:
+                            logger.info("Requesting CapSolver to solve hCaptcha...")
+                            hcaptcha_token = solve_hcaptcha(VFS_LOGIN_URL, hcap_sitekey)
+                            logger.info(
+                                "hCaptcha solved! Token length: %d",
+                                len(hcaptcha_token),
+                            )
+                            await _inject_hcaptcha_token(page, hcaptcha_token)
+                    except Exception as e:
+                        logger.warning(
+                            "hCaptcha solve/inject failed (%s) — proceeding without",
+                            e,
+                        )
+
                     # ── PRIMARY: Try direct API login (bypasses Angular entirely) ──
                     logger.info("Attempting direct API login (bypasses Angular form)...")
-                    login_resp = _direct_api_login(token)
+                    login_resp = _direct_api_login(token, hcaptcha_token=hcaptcha_token)
                     if login_resp:
                         # Extract JWT from response
                         direct_jwt = None
@@ -2051,6 +2219,9 @@ async def _do_login() -> dict:
             # Determine best captcha token for route interceptor
             solved_captcha_token = token if sitekey else ""
             captcha_version = "Turnstile"
+            # hcaptcha_token may not exist if we didn't reach the Turnstile
+            # branch (no sitekey → we never set it). Normalize for closure.
+            solved_hcaptcha_token = locals().get("hcaptcha_token", "") or ""
 
             # ── ROUTE INTERCEPTOR: Inject captcha token into login API POST ──
             # Belt-and-suspenders: even if fake Turnstile callback works,
@@ -2099,6 +2270,35 @@ async def _do_login() -> dict:
                                 body["captcha_version"] = captcha_version
                                 modified = True
                                 logger.info("[route] Added captcha_version=%s to login body", captcha_version)
+
+                            # hCaptcha fields (added by VFS UAE in late June).
+                            # We don't yet know the exact field name — send
+                            # under all plausible ones when we have a token.
+                            if solved_hcaptcha_token:
+                                for fld in (
+                                    "hcaptcha_token", "hcaptcha_api_key",
+                                    "h_captcha_response", "hcaptchaResponse",
+                                ):
+                                    if fld not in body:
+                                        body[fld] = solved_hcaptcha_token
+                                        modified = True
+                                logger.info(
+                                    "[route] Added hCaptcha token to login body "
+                                    "(len=%d)", len(solved_hcaptcha_token),
+                                )
+
+                        # Also fill hCaptcha into ANY existing empty
+                        # h/hcaptcha-shaped field, not just login POSTs.
+                        if solved_hcaptcha_token:
+                            for field in list(body.keys()):
+                                fl = field.lower()
+                                if "hcaptcha" in fl or "h_captcha" in fl or "h-captcha" in fl:
+                                    if not body[field]:
+                                        body[field] = solved_hcaptcha_token
+                                        modified = True
+                                        logger.info(
+                                            "[route] Injected hCaptcha into %s", field,
+                                        )
 
                         if modified:
                             logger.info("[route] Final body keys: %s", list(body.keys()))

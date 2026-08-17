@@ -120,6 +120,129 @@ def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> s
     raise RuntimeError(f"CapSolver timeout after {timeout}s")
 
 
+def solve_hcaptcha(
+    website_url: str, website_key: str, timeout: int = 180,
+    invisible: bool = False, is_enterprise: bool = False,
+    enterprise_payload: dict | None = None, user_agent: str | None = None,
+) -> str:
+    """
+    Solve an hCaptcha challenge via CapSolver API.
+
+    Args:
+        website_url: The URL of the page with the hCaptcha widget.
+        website_key: The hCaptcha sitekey (usually a UUID).
+        timeout: Max seconds to wait for a solution. hCaptcha challenges
+                 can take 60-150s to solve, so timeout defaults higher
+                 than Turnstile.
+        invisible: True if this is an invisible hCaptcha (no visible widget).
+        is_enterprise: True for hCaptcha Enterprise.
+        enterprise_payload: Optional dict with enterprise-specific params
+                            (rqdata, sentry, apiEndpoint, etc.).
+        user_agent: Optional UA string; helps CapSolver match browser fingerprint.
+
+    Returns:
+        The solved hCaptcha response token (goes into the
+        `h-captcha-response` hidden input / `hcaptcha` callback).
+
+    Raises:
+        RuntimeError: If solving fails or times out.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError("CAPSOLVER_API_KEY environment variable not set")
+
+    logger.info(
+        "Solving hCaptcha for %s (sitekey=%s..., invisible=%s, enterprise=%s)",
+        website_url, website_key[:12], invisible, is_enterprise,
+    )
+
+    if is_enterprise:
+        task_type = "HCaptchaEnterpriseTask" if user_agent else "HCaptchaEnterpriseTaskProxyLess"
+    else:
+        task_type = "HCaptchaTaskProxyLess"
+
+    task: dict = {
+        "type": task_type,
+        "websiteURL": website_url,
+        "websiteKey": website_key,
+        "isInvisible": invisible,
+    }
+    if enterprise_payload:
+        task["enterprisePayload"] = enterprise_payload
+    if user_agent:
+        task["userAgent"] = user_agent
+
+    payload = json.dumps({"clientKey": api_key, "task": task}).encode("utf-8")
+
+    req = Request(CAPSOLVER_CREATE_URL, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        resp = urlopen(req, timeout=30)
+        data = json.loads(resp.read().decode("utf-8"))
+    except (URLError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"CapSolver createTask failed: {e}")
+
+    if data.get("errorId") and data.get("errorId") != 0:
+        raise RuntimeError(f"CapSolver error: {data.get('errorDescription', data)}")
+
+    task_id = data.get("taskId")
+    if not task_id:
+        raise RuntimeError(f"CapSolver returned no taskId: {data}")
+
+    logger.info("hCaptcha task created: %s — polling for result...", task_id)
+
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(5)  # hCaptcha polling: longer than Turnstile
+
+        poll_payload = json.dumps({
+            "clientKey": api_key, "taskId": task_id,
+        }).encode("utf-8")
+
+        poll_req = Request(CAPSOLVER_RESULT_URL, data=poll_payload, method="POST")
+        poll_req.add_header("Content-Type", "application/json")
+
+        try:
+            poll_resp = urlopen(poll_req, timeout=30)
+            result = json.loads(poll_resp.read().decode("utf-8"))
+        except (URLError, json.JSONDecodeError) as e:
+            logger.warning("hCaptcha poll error: %s — retrying...", e)
+            continue
+
+        status = result.get("status", "")
+
+        if status == "ready":
+            sol = result.get("solution", {}) or {}
+            # CapSolver returns hCaptcha token under different keys depending
+            # on task type / enterprise; check the common ones.
+            token = (
+                sol.get("gRecaptchaResponse")
+                or sol.get("token")
+                or sol.get("hCaptchaResponse")
+                or sol.get("captchaResponse")
+                or ""
+            )
+            if token:
+                elapsed = int(time.time() - start)
+                logger.info(
+                    "hCaptcha solved in %ds (token length: %d)", elapsed, len(token),
+                )
+                return token
+            raise RuntimeError(
+                f"CapSolver returned ready but no hCaptcha token in solution: {result}"
+            )
+
+        if status == "failed":
+            raise RuntimeError(
+                f"CapSolver hCaptcha task failed: {result.get('errorDescription', result)}"
+            )
+
+        logger.debug("hCaptcha task status: %s — waiting...", status)
+
+    raise RuntimeError(f"CapSolver hCaptcha timeout after {timeout}s")
+
+
 def solve_recaptcha_v3(
     website_url: str, website_key: str, page_action: str = "login", timeout: int = 120
 ) -> str:
