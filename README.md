@@ -76,3 +76,81 @@ Edit `scanner/vfs_checker.py` to change:
 - `CENTRES` - which VFS centres to check
 - `CATEGORY` / `SUBCATEGORY` - visa type
 - The script also discovers API endpoints during each run, logged in the output
+
+---
+
+# Nike.com.br Scheduled Purchase Bot
+
+A separate service in this repo that logs into nike.com.br, waits for a
+product to become available at a scheduled drop time, and buys it.
+
+Entry point: `python nike_main.py` (same Docker image as the VFS scanner —
+just override the start command on the Railway service).
+
+## Railway env vars
+
+Required:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `NIKE_EMAIL` | Login email for your nike.com.br account | `you@example.com` |
+| `NIKE_PASSWORD` | Account password | `...` |
+| `NIKE_PRODUCT_URL` | Full URL of the product page | `https://www.nike.com.br/tenis-...` |
+| `NIKE_PRODUCT_SIZE` | Size label exactly as shown on the page | `42` or `10.5` |
+
+Scheduling / behavior:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NIKE_DROP_TIME` | _(empty → immediate)_ | Local drop time, ISO format (`2026-04-18T10:00:00`). Parsed in `NIKE_TIMEZONE`. |
+| `NIKE_TIMEZONE` | `America/Sao_Paulo` | Used when `NIKE_DROP_TIME` has no explicit offset |
+| `NIKE_PRE_LOGIN_MINUTES` | `5` | How many minutes before drop to log in |
+| `NIKE_REFRESH_INTERVAL_MS` | `800` | Page reload interval once drop window opens |
+| `NIKE_MAX_RUNTIME_MINUTES` | `15` | Hard cap on polling/purchase time |
+| `NIKE_DRY_RUN` | `true` | If `true`, stop BEFORE the final "Finalizar pedido" click and save a screenshot. Flip to `false` to actually pay. |
+| `NIKE_HEADLESS` | `true` | Set to `false` locally to watch the browser |
+| `NIKE_USER_AGENT` | _Chrome 133 on Linux_ | Override if needed |
+| `NIKE_STORAGE_STATE` | `/tmp/nike_state.json` | Where to persist cookies between runs |
+
+Notifications (reused from the VFS scanner — same Resend account):
+
+| Variable | Description |
+|----------|-------------|
+| `RESEND_API_KEY` | API key from resend.com |
+| `NOTIFY_TO` | Comma-separated recipient emails |
+| `NOTIFY_FROM` | Sender, e.g. `Nike Bot <notifications@resend.dev>` |
+
+## Deploying to Railway
+
+1. Create a second service in the same Railway project, pointed at this repo.
+2. In the new service's **Settings → Deploy**, override:
+   - **Start command**: `python nike_main.py`
+3. Add the env vars above.
+4. First deploy: keep `NIKE_DRY_RUN=true`. The service will log in, walk to
+   the checkout review page, screenshot it, and stop. Review the logs and the
+   screenshot before flipping `NIKE_DRY_RUN=false`.
+
+## Local test
+
+```bash
+pip install -r requirements.txt
+patchright install --with-deps chromium
+
+export NIKE_EMAIL=...
+export NIKE_PASSWORD=...
+export NIKE_PRODUCT_URL="https://www.nike.com.br/..."
+export NIKE_PRODUCT_SIZE="42"
+export NIKE_DRY_RUN=true
+export NIKE_HEADLESS=false   # watch it run
+
+python nike_main.py
+```
+
+## Safety
+
+- `NIKE_DRY_RUN=true` is the default. Nothing is paid until you explicitly
+  set it to `false`.
+- On dry runs a screenshot of the review page is saved to
+  `/tmp/nike-checkout-review.png` so you can verify the cart contents,
+  shipping address, and payment method before allowing real submissions.
+- `NIKE_MAX_RUNTIME_MINUTES` caps how long the service will keep trying.

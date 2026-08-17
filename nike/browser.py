@@ -1,0 +1,177 @@
+"""Patchright (stealth Playwright) browser setup for Nike.com.br.
+
+Uses `launch_persistent_context` (as recommended by the Patchright docs for
+maximum stealth) with a persistent user data dir so cookies, fingerprint,
+and device state carry over across runs. This is harder for Akamai / Kasada /
+PerimeterX-style bot managers to detect than a fresh launch with extra args.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+
+from patchright.async_api import async_playwright
+
+from nike.config import NikeConfig
+
+logger = logging.getLogger("nike.browser")
+
+
+@asynccontextmanager
+async def browser_context(cfg: NikeConfig):
+    """Yield a (browser, context, page) tuple.
+
+    Modes (checked in order):
+
+    1. CDP mode (NIKE_CDP_URL set): connect to an existing Chrome the user
+       launched manually. Launch Chrome first:
+         Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome
+       Then set NIKE_CDP_URL=http://localhost:9222.
+
+    2. Storage-state mode (NIKE_STORAGE_STATE_JSON or NIKE_STORAGE_STATE
+       file exists): launch chromium NON-persistently and inject cookies +
+       localStorage. Used for headless runs on Railway where there's no
+       browser UI available for manual login.
+
+    3. Launch mode (default): Patchright launch_persistent_context with
+       real Chrome (channel="chrome") → bundled Chromium fallback.
+    """
+    import json
+    cdp_url = os.environ.get("NIKE_CDP_URL", "").strip()
+
+    async with async_playwright() as pw:
+        if cdp_url:
+            logger.info("Connecting to existing Chrome via CDP: %s", cdp_url)
+            browser = await pw.chromium.connect_over_cdp(cdp_url)
+            # Reuse the first (user-facing) context / page so we inherit any
+            # cookies and the browser-launched process signature.
+            if browser.contexts:
+                context = browser.contexts[0]
+            else:
+                context = await browser.new_context(
+                    locale="pt-BR", timezone_id=cfg.timezone
+                )
+            page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                yield browser, context, page
+            finally:
+                # Don't close the user's browser; just disconnect.
+                await browser.close()
+            return
+
+        storage_json = os.environ.get("NIKE_STORAGE_STATE_JSON", "").strip()
+        storage_path = os.environ.get("NIKE_STORAGE_STATE", "").strip()
+        if storage_json or (storage_path and os.path.exists(storage_path)):
+            if storage_json:
+                storage = json.loads(storage_json)
+                logger.info(
+                    "Using NIKE_STORAGE_STATE_JSON (%d cookies)",
+                    len(storage.get("cookies", [])),
+                )
+            else:
+                with open(storage_path) as f:
+                    storage = json.load(f)
+                logger.info("Using storage state from %s", storage_path)
+            # Patchright's stealth is weaker with non-persistent launches,
+            # so prefer launch_persistent_context even here — we just
+            # preload cookies via add_cookies after launch.
+            user_data_dir = os.environ.get("NIKE_USER_DATA_DIR", "/tmp/nike-user-data")
+            os.makedirs(user_data_dir, exist_ok=True)
+            channel = os.environ.get("NIKE_BROWSER_CHANNEL", "chrome")
+            launch_kwargs = dict(
+                user_data_dir=user_data_dir,
+                headless=cfg.headless,
+                locale="pt-BR",
+                timezone_id=cfg.timezone,
+                viewport={"width": 1280, "height": 800},
+                user_agent=cfg.user_agent,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-infobars",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                ],
+            )
+            proxy_server = os.environ.get("NIKE_PROXY_SERVER", "").strip()
+            if proxy_server:
+                proxy_cfg = {"server": proxy_server}
+                pu = os.environ.get("NIKE_PROXY_USERNAME", "").strip()
+                pp = os.environ.get("NIKE_PROXY_PASSWORD", "").strip()
+                if pu:
+                    proxy_cfg["username"] = pu
+                if pp:
+                    proxy_cfg["password"] = pp
+                launch_kwargs["proxy"] = proxy_cfg
+                logger.info("Using proxy %s (user=%s)", proxy_server, pu or "(none)")
+            try:
+                context = await pw.chromium.launch_persistent_context(
+                    channel=channel, **launch_kwargs,
+                )
+            except Exception as e:
+                logger.warning(
+                    "channel=%s unavailable (%s) — falling back to bundled chromium",
+                    channel, e,
+                )
+                context = await pw.chromium.launch_persistent_context(**launch_kwargs)
+            if storage.get("cookies"):
+                # Drop Akamai bot-manager / CDN cookies — they are bound to
+                # the client IP and fingerprint that originally issued them;
+                # reusing them from a different egress IP trips Akamai's
+                # "Access Denied" on product PDPs. Keep only the tokens
+                # Nike actually uses for auth / session.
+                AKAMAI_PREFIXES = ("_abck", "ak_bmsc", "bm_", "sec_cpt", "AKA_A2", "RT")
+                kept = [
+                    c for c in storage["cookies"]
+                    if not any(c.get("name", "").startswith(p) for p in AKAMAI_PREFIXES)
+                ]
+                dropped = len(storage["cookies"]) - len(kept)
+                await context.add_cookies(kept)
+                logger.info(
+                    "Injected %d cookies (dropped %d Akamai-bound)",
+                    len(kept), dropped,
+                )
+            page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                yield None, context, page
+            finally:
+                await context.close()
+            return
+
+        user_data_dir = os.environ.get(
+            "NIKE_USER_DATA_DIR", "/tmp/nike-user-data"
+        )
+        os.makedirs(user_data_dir, exist_ok=True)
+        logger.info("Using persistent user data dir: %s", user_data_dir)
+
+        channel = os.environ.get("NIKE_BROWSER_CHANNEL", "chrome")
+        try:
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel=channel,
+                headless=cfg.headless,
+                no_viewport=True,
+                locale="pt-BR",
+                timezone_id=cfg.timezone,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not launch with channel=%s (%s), falling back to bundled chromium",
+                channel, e,
+            )
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=cfg.headless,
+                no_viewport=True,
+                locale="pt-BR",
+                timezone_id=cfg.timezone,
+            )
+
+        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            yield None, context, page
+        finally:
+            await context.close()
