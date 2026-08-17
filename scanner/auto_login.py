@@ -208,9 +208,23 @@ async def _inject_turnstile_token(page, token: str):
 
 
 async def _extract_hcaptcha_sitekey(page) -> str:
-    """Return the hCaptcha sitekey on the page, or "" if no widget present."""
+    """Return the hCaptcha sitekey on the page, or "" if no widget present.
+
+    Preference order:
+      1. `window.__capturedHcaptchaSitekey` set by our init-script fake
+         when Angular / the vendor script calls `hcaptcha.render({sitekey})`.
+         This is the ground truth — the sitekey the page actually uses.
+      2. DOM sniff (data-sitekey, iframe src, inline scripts) as fallback
+         for pages that render the widget declaratively.
+      3. `VFS_HCAPTCHA_SITEKEY` env var override.
+    """
     sitekey = await page.evaluate("""
         () => {
+            // 1. Captured by the init-script fake on hcaptcha.render()
+            if (window.__capturedHcaptchaSitekey) {
+                return window.__capturedHcaptchaSitekey;
+            }
+            // 2. DOM sniff
             const el = document.querySelector('.h-captcha[data-sitekey], [data-hcaptcha-sitekey]');
             if (el) {
                 return el.getAttribute('data-sitekey') || el.getAttribute('data-hcaptcha-sitekey');
@@ -240,6 +254,22 @@ async def _extract_hcaptcha_sitekey(page) -> str:
     return sitekey
 
 
+async def _extract_hcaptcha_rqdata(page) -> str:
+    """Return `rqdata` for hCaptcha Enterprise, or "" if not present.
+
+    `rqdata` is a signed request blob the site passes to `hcaptcha.render`
+    for the enterprise variant. Without it, `HCaptchaEnterpriseTaskProxyLess`
+    on CapSolver will not return a valid token. Captured by our init-script
+    fake at render-time.
+    """
+    rqdata = await page.evaluate(
+        "() => window.__capturedHcaptchaRqdata || ''"
+    )
+    if rqdata:
+        logger.info("Found hCaptcha rqdata (len=%d) — using enterprise task", len(rqdata))
+    return rqdata or ""
+
+
 async def _inject_hcaptcha_token(page, token: str) -> dict:
     """Inject a solved hCaptcha token into the page.
 
@@ -257,6 +287,22 @@ async def _inject_hcaptcha_token(page, token: str) -> dict:
             const r = {};
             window.__hcaptchaToken = token;
 
+            // 1. Invoke every captured render callback. This is the ONE
+            //    thing the widget's own JS listens for — filling the
+            //    textarea alone leaves the visible checkbox unchecked
+            //    and the Sign In button disabled.
+            const cbs = window.__allHcaptchaCallbacks || [];
+            r.captured_cbs = cbs.length;
+            r.cbs_invoked = 0;
+            for (let i = 0; i < cbs.length; i++) {
+                try {
+                    cbs[i](token);
+                    r.cbs_invoked++;
+                } catch(e) { r['cb_err_' + i] = e.message; }
+            }
+
+            // 2. Hidden textareas / inputs (belt for anything reading
+            //    values directly instead of the callback).
             const selectors = [
                 'textarea[name="h-captcha-response"]',
                 'textarea[name="g-recaptcha-response"]',
@@ -275,27 +321,19 @@ async def _inject_hcaptcha_token(page, token: str) -> dict:
                 });
             }
 
-            r.callbacks = [];
+            // 3. Named global callbacks (data-callback shape).
+            r.global_cbs = [];
             const cbNames = [
                 'onHcaptchaSuccess', 'onHcaptchaVerify', 'onHCaptchaSuccess',
                 'onHCaptchaVerify', 'hcaptchaCallback', '__hcaptchaCallback',
             ];
             for (const n of cbNames) {
                 if (typeof window[n] === 'function') {
-                    try { window[n](token); r.callbacks.push(n); } catch(e) {}
+                    try { window[n](token); r.global_cbs.push(n); } catch(e) {}
                 }
             }
 
-            if (window.hcaptcha) {
-                r.hcaptcha_object = true;
-                try {
-                    const containers = document.querySelectorAll(
-                        '[data-hcaptcha-widget-id]');
-                    r.widget_ids = [...containers].map(
-                        c => c.getAttribute('data-hcaptcha-widget-id'));
-                } catch(e) { r.widget_err = e.message; }
-            }
-
+            // 4. Angular reactive-form controls whose name mentions hcaptcha.
             const allEls = document.querySelectorAll('*');
             let patched = 0;
             for (let i = 0; i < allEls.length && patched < 3; i++) {
@@ -770,6 +808,149 @@ async def _do_login() -> dict:
                 console.log('INIT_CAPTCHA_OK ts_type=' + typeof window.turnstile);
             } catch(e) { console.log('INIT_CAPTCHA_FAIL:'+e.message); }
 
+            // ── HCAPTCHA: mirror of the Turnstile fake, for VFS's new
+            //             hCaptcha widget (added late June 2026). Fills the
+            //             same role as the Turnstile fake: captures the
+            //             render callback + sitekey + rqdata during Angular
+            //             bootstrap so we can invoke the callback with a
+            //             CapSolver-provided token later. See how the
+            //             Turnstile fake works above — this is the same
+            //             pattern one-to-one.
+            try {
+                window.__hcaptchaToken = null;
+                window.__hcaptchaCallback = null;
+                window.__allHcaptchaCallbacks = [];
+                window.__capturedHcaptchaSitekey = null;
+                window.__capturedHcaptchaRqdata = null;
+                window.__hcaptchaWidgets = {};
+                window.__hcaptchaNextWidgetId = 0;
+
+                var _fakeHc = {
+                    render: function(container, options) {
+                        console.log('FAKE_HC_RENDER');
+                        if (options) {
+                            if (options.sitekey) {
+                                window.__capturedHcaptchaSitekey = options.sitekey;
+                                console.log('FAKE_HC_SITEKEY:' + options.sitekey);
+                            }
+                            if (options.rqdata) {
+                                window.__capturedHcaptchaRqdata = options.rqdata;
+                                console.log('FAKE_HC_RQDATA len=' + (options.rqdata || '').length);
+                            }
+                            if (typeof options.callback === 'function') {
+                                window.__hcaptchaCallback = options.callback;
+                                window.__allHcaptchaCallbacks.push(options.callback);
+                                console.log('FAKE_HC_CB_CAPTURED total=' +
+                                    window.__allHcaptchaCallbacks.length);
+                                if (window.__hcaptchaToken) {
+                                    try {
+                                        options.callback(window.__hcaptchaToken);
+                                        console.log('FAKE_HC_CB_INVOKED_IMMEDIATE');
+                                    } catch(e) { console.log('FAKE_HC_CB_ERR:'+e.message); }
+                                }
+                            }
+                            if (options['error-callback']) {
+                                options['error-callback'] = function() {
+                                    console.log('FAKE_HC_ERROR_SUPPRESSED');
+                                };
+                            }
+                            if (options['expired-callback']) {
+                                options['expired-callback'] = function() {
+                                    console.log('FAKE_HC_EXPIRED_SUPPRESSED');
+                                };
+                            }
+                            if (options['chalexpired-callback']) {
+                                options['chalexpired-callback'] = function() {
+                                    console.log('FAKE_HC_CHALEXP_SUPPRESSED');
+                                };
+                            }
+                        }
+                        var id = 'fake_hc_widget_' + window.__hcaptchaNextWidgetId++;
+                        window.__hcaptchaWidgets[id] = options || {};
+                        return id;
+                    },
+                    execute: function(widgetId, options) {
+                        console.log('FAKE_HC_EXECUTE');
+                        // Signature: execute(widgetId?, opts?) — widgetId
+                        // and opts are both optional in different versions.
+                        var opts = (options && typeof options === 'object') ? options :
+                                   (widgetId && typeof widgetId === 'object') ? widgetId : {};
+                        if (typeof opts.callback === 'function') {
+                            window.__hcaptchaCallback = opts.callback;
+                            window.__allHcaptchaCallbacks.push(opts.callback);
+                            console.log('FAKE_HC_EXEC_CB_CAPTURED');
+                            if (window.__hcaptchaToken) {
+                                try { opts.callback(window.__hcaptchaToken); } catch(e) {}
+                            }
+                        }
+                        return Promise.resolve({response: window.__hcaptchaToken || ''});
+                    },
+                    getResponse: function() { return window.__hcaptchaToken || ''; },
+                    getRespKey: function() { return window.__hcaptchaToken || ''; },
+                    reset: function() { console.log('FAKE_HC_RESET'); },
+                    remove: function() {},
+                    close: function() {},
+                    setData: function() {},
+                    __wrapped: true
+                };
+
+                function _wrapHcaptcha(hc) {
+                    if (!hc || typeof hc !== 'object' || hc.__wrapped) return;
+                    if (typeof hc.render === 'function') {
+                        var origRender = hc.render.bind(hc);
+                        hc.render = function(container, options) {
+                            console.log('HC_REAL_RENDER_INTERCEPTED');
+                            if (options) {
+                                if (options.sitekey) {
+                                    window.__capturedHcaptchaSitekey = options.sitekey;
+                                }
+                                if (options.rqdata) {
+                                    window.__capturedHcaptchaRqdata = options.rqdata;
+                                }
+                                if (typeof options.callback === 'function') {
+                                    window.__hcaptchaCallback = options.callback;
+                                    window.__allHcaptchaCallbacks.push(options.callback);
+                                    console.log('HC_REAL_CB_CAPTURED');
+                                    if (window.__hcaptchaToken) {
+                                        try {
+                                            options.callback(window.__hcaptchaToken);
+                                            console.log('HC_REAL_CB_INVOKED');
+                                        } catch(e) {}
+                                    }
+                                }
+                                if (options['error-callback']) {
+                                    options['error-callback'] = function() {
+                                        console.log('HC_REAL_ERROR_SUPPRESSED');
+                                    };
+                                }
+                            }
+                            try { return origRender(container, options); }
+                            catch(e) { return 'hcw0'; }
+                        };
+                    }
+                    hc.__wrapped = true;
+                    console.log('HC_REAL_WRAPPED_OK');
+                }
+
+                window.hcaptcha = _fakeHc;
+                console.log('INIT_HC_DIRECT hc_type=' + typeof window.hcaptcha);
+
+                var _hcGuardInterval = setInterval(function() {
+                    if (typeof window.hcaptcha === 'undefined' ||
+                        window.hcaptcha === null) {
+                        window.hcaptcha = _fakeHc;
+                        console.log('HC_GUARD_RESTORED');
+                    } else if (window.hcaptcha !== _fakeHc &&
+                               !window.hcaptcha.__wrapped) {
+                        _wrapHcaptcha(window.hcaptcha);
+                        console.log('HC_GUARD_WRAPPED');
+                    }
+                }, 200);
+                setTimeout(function() { clearInterval(_hcGuardInterval); }, 120000);
+
+                console.log('INIT_HCAPTCHA_OK hc_type=' + typeof window.hcaptcha);
+            } catch(e) { console.log('INIT_HCAPTCHA_FAIL:'+e.message); }
+
             // ── XHR INTERCEPTOR ──
             // Belt-and-suspenders: intercept login POST at XMLHttpRequest level
             // and inject captcha token. Works even if Angular's form validation
@@ -803,6 +984,21 @@ async def _do_login() -> dict:
                                         json.captcha_version = 'Turnstile';
                                         modified = true;
                                     }
+                                }
+                                // hCaptcha token — added under several
+                                // field names, same as the Playwright-level
+                                // route interceptor.
+                                if (window.__hcaptchaToken) {
+                                    var hcFields = ['hcaptcha_token', 'hcaptcha_api_key',
+                                                    'h_captcha_response', 'hcaptchaResponse'];
+                                    for (var f = 0; f < hcFields.length; f++) {
+                                        var name = hcFields[f];
+                                        if (!json[name] || json[name] === '') {
+                                            json[name] = window.__hcaptchaToken;
+                                            modified = true;
+                                        }
+                                    }
+                                    console.log('XHR_HCAPTCHA_INJECTED');
                                 }
                                 if (modified) {
                                     body = JSON.stringify(json);
@@ -1658,16 +1854,33 @@ async def _do_login() -> dict:
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
                     # ── hCaptcha (added by VFS UAE in late June 2026) ──
-                    # If a widget is present on the page, solve + inject in
-                    # the same manner as Turnstile. Held in `hcaptcha_token`
-                    # for use by _direct_api_login and the route interceptor.
+                    # 1. Read sitekey + rqdata captured by our init-script
+                    #    fake at hcaptcha.render() time.
+                    # 2. If rqdata is present, use the *enterprise* variant
+                    #    (HCaptchaEnterpriseTaskProxyLess); CapSolver returns
+                    #    an invalid token from the standard task otherwise.
+                    # 3. On success, _inject_hcaptcha_token invokes every
+                    #    captured widget callback so the visible checkbox
+                    #    flips green and the Sign In button enables.
                     hcaptcha_token = ""
                     try:
                         hcap_sitekey = await _extract_hcaptcha_sitekey(page)
                         if hcap_sitekey:
-                            logger.info("Requesting CapSolver to solve hCaptcha...")
+                            hcap_rqdata = await _extract_hcaptcha_rqdata(page)
+                            enterprise_payload = None
+                            is_enterprise = False
+                            if hcap_rqdata:
+                                is_enterprise = True
+                                enterprise_payload = {"rqdata": hcap_rqdata}
+                            logger.info(
+                                "Requesting CapSolver to solve hCaptcha "
+                                "(enterprise=%s)...", is_enterprise,
+                            )
                             hcaptcha_token = solve_hcaptcha(
-                                VFS_LOGIN_URL, hcap_sitekey, proxy=capsolver_proxy,
+                                VFS_LOGIN_URL, hcap_sitekey,
+                                proxy=capsolver_proxy,
+                                is_enterprise=is_enterprise,
+                                enterprise_payload=enterprise_payload,
                             )
                             logger.info(
                                 "hCaptcha solved! Token length: %d",
