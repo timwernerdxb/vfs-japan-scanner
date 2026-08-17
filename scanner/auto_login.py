@@ -1628,8 +1628,33 @@ async def _do_login() -> dict:
                         ]
                     logger.info("Angular diagnostic: %s", safe_diag)
 
+                    # Build a proxy dict for CapSolver so the solved token
+                    # is IP-bound to the SAME network we'll submit from.
+                    # Otherwise Cloudflare returns 600010 on the challenge
+                    # even with a valid-looking token.
+                    capsolver_proxy: dict | None = None
+                    if PROXY_ENABLED:
+                        if PROXY_SERVER:
+                            _server = PROXY_SERVER
+                            if "://" not in _server:
+                                _server = f"http://{_server}"
+                            capsolver_proxy = {
+                                "server": _server,
+                                "username": PROXY_USER or "",
+                                "password": PROXY_PASS or "",
+                            }
+                        elif PROXY_URL:
+                            capsolver_proxy = {"server": PROXY_URL}
+                        if capsolver_proxy:
+                            logger.info(
+                                "Passing proxy %s to CapSolver so tokens are IP-bound",
+                                capsolver_proxy.get("server"),
+                            )
+
                     logger.info("Requesting CapSolver to solve Turnstile...")
-                    token = solve_turnstile(VFS_LOGIN_URL, sitekey)
+                    token = solve_turnstile(
+                        VFS_LOGIN_URL, sitekey, proxy=capsolver_proxy,
+                    )
                     logger.info("Turnstile solved! Token length: %d", len(token))
 
                     # ── hCaptcha (added by VFS UAE in late June 2026) ──
@@ -1641,7 +1666,9 @@ async def _do_login() -> dict:
                         hcap_sitekey = await _extract_hcaptcha_sitekey(page)
                         if hcap_sitekey:
                             logger.info("Requesting CapSolver to solve hCaptcha...")
-                            hcaptcha_token = solve_hcaptcha(VFS_LOGIN_URL, hcap_sitekey)
+                            hcaptcha_token = solve_hcaptcha(
+                                VFS_LOGIN_URL, hcap_sitekey, proxy=capsolver_proxy,
+                            )
                             logger.info(
                                 "hCaptcha solved! Token length: %d",
                                 len(hcaptcha_token),

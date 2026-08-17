@@ -32,7 +32,49 @@ def _get_api_key() -> str:
     return key
 
 
-def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> str:
+def _proxy_task_fields(proxy: dict | None) -> dict:
+    """Turn a proxy dict into the four fields CapSolver's proxied tasks want.
+
+    Accepts either the shape used elsewhere in this repo
+    ({"server": "host:port", "username": "...", "password": "..."}) or
+    a direct dict with proxyType/proxyAddress/... already set.
+    """
+    if not proxy:
+        return {}
+    if "proxyAddress" in proxy:
+        return proxy
+    server = str(proxy.get("server", "")).strip()
+    if not server:
+        return {}
+    # Strip scheme if present
+    if "://" in server:
+        scheme, rest = server.split("://", 1)
+    else:
+        scheme, rest = "http", server
+    if ":" in rest:
+        host, port_s = rest.rsplit(":", 1)
+    else:
+        host, port_s = rest, "80"
+    try:
+        port = int(port_s)
+    except ValueError:
+        port = 80
+    fields = {
+        "proxyType": scheme,
+        "proxyAddress": host,
+        "proxyPort": port,
+    }
+    if proxy.get("username"):
+        fields["proxyLogin"] = proxy["username"]
+    if proxy.get("password"):
+        fields["proxyPassword"] = proxy["password"]
+    return fields
+
+
+def solve_turnstile(
+    website_url: str, website_key: str, timeout: int = 120,
+    proxy: dict | None = None,
+) -> str:
     """
     Solve a Cloudflare Turnstile challenge via CapSolver API.
 
@@ -40,6 +82,13 @@ def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> s
         website_url: The URL of the page with the Turnstile widget.
         website_key: The Turnstile sitekey (usually starts with 0x4...).
         timeout: Max seconds to wait for solution.
+        proxy: Optional proxy dict. When provided, CapSolver uses the
+            proxied task variant (`AntiTurnstileTask`) so the token is
+            bound to *that* egress IP — required when the solved token
+            will be submitted from a different network than CapSolver's
+            own pool (which triggers Cloudflare 600010 "challenge
+            failed"). Shape: {"server": "host:port", "username": "..",
+            "password": ".."}.
 
     Returns:
         The solved Turnstile token string.
@@ -51,16 +100,32 @@ def solve_turnstile(website_url: str, website_key: str, timeout: int = 120) -> s
     if not api_key:
         raise RuntimeError("CAPSOLVER_API_KEY environment variable not set")
 
-    logger.info("Solving Turnstile for %s (sitekey=%s...)", website_url, website_key[:12])
+    proxy_fields = _proxy_task_fields(proxy)
+    if proxy_fields:
+        task_type = "AntiTurnstileTask"
+        logger.info(
+            "Solving Turnstile for %s (sitekey=%s...) via proxy %s:%s",
+            website_url, website_key[:12],
+            proxy_fields.get("proxyAddress"), proxy_fields.get("proxyPort"),
+        )
+    else:
+        task_type = "AntiTurnstileTaskProxyLess"
+        logger.info(
+            "Solving Turnstile for %s (sitekey=%s...) — proxyless "
+            "(token will be IP-bound to CapSolver's pool!)",
+            website_url, website_key[:12],
+        )
 
     # Step 1: Create task
+    task = {
+        "type": task_type,
+        "websiteURL": website_url,
+        "websiteKey": website_key,
+    }
+    task.update(proxy_fields)
     payload = json.dumps({
         "clientKey": api_key,
-        "task": {
-            "type": "AntiTurnstileTaskProxyLess",
-            "websiteURL": website_url,
-            "websiteKey": website_key,
-        },
+        "task": task,
     }).encode("utf-8")
 
     req = Request(CAPSOLVER_CREATE_URL, data=payload, method="POST")
@@ -124,6 +189,7 @@ def solve_hcaptcha(
     website_url: str, website_key: str, timeout: int = 180,
     invisible: bool = False, is_enterprise: bool = False,
     enterprise_payload: dict | None = None, user_agent: str | None = None,
+    proxy: dict | None = None,
 ) -> str:
     """
     Solve an hCaptcha challenge via CapSolver API.
@@ -156,10 +222,17 @@ def solve_hcaptcha(
         website_url, website_key[:12], invisible, is_enterprise,
     )
 
+    proxy_fields = _proxy_task_fields(proxy)
+    proxied = bool(proxy_fields)
     if is_enterprise:
-        task_type = "HCaptchaEnterpriseTask" if user_agent else "HCaptchaEnterpriseTaskProxyLess"
+        task_type = "HCaptchaEnterpriseTask" if proxied else "HCaptchaEnterpriseTaskProxyLess"
     else:
-        task_type = "HCaptchaTaskProxyLess"
+        task_type = "HCaptchaTask" if proxied else "HCaptchaTaskProxyLess"
+    if proxied:
+        logger.info(
+            "hCaptcha will be solved via proxy %s:%s (IP-bound token)",
+            proxy_fields.get("proxyAddress"), proxy_fields.get("proxyPort"),
+        )
 
     task: dict = {
         "type": task_type,
@@ -167,6 +240,7 @@ def solve_hcaptcha(
         "websiteKey": website_key,
         "isInvisible": invisible,
     }
+    task.update(proxy_fields)
     if enterprise_payload:
         task["enterprisePayload"] = enterprise_payload
     if user_agent:
