@@ -244,7 +244,7 @@ async def _extract_hcaptcha_sitekey(page) -> str:
             }
             return '';
         }
-    """)
+    """, isolated_context=False)
     if not sitekey:
         sitekey = (os.environ.get("VFS_HCAPTCHA_SITEKEY", "") or "").strip()
     if sitekey:
@@ -264,7 +264,7 @@ async def _extract_hcaptcha_rqdata(page) -> str:
     """
     rqdata = await page.evaluate(
         "() => window.__capturedHcaptchaRqdata || ''"
-    )
+    , isolated_context=False)
     if rqdata:
         logger.info("Found hCaptcha rqdata (len=%d) — using enterprise task", len(rqdata))
     return rqdata or ""
@@ -361,7 +361,7 @@ async def _inject_hcaptcha_token(page, token: str) -> dict:
             r.fg_patched = patched;
             return r;
         }
-    """, token)
+    """, token, isolated_context=False)
     logger.info("hCaptcha token injected: %s", result)
     return result
 
@@ -641,8 +641,16 @@ async def _do_login() -> dict:
         # Init script: stealth patches + CAPTCHA interception
         # CRITICAL: Each section wrapped in try/catch — a single throw
         # (e.g. non-configurable navigator.connection) kills the entire script.
+        # NOTE: add_init_script() injects this string as RAW SOURCE at
+        # document-start — unlike page.evaluate(), it does NOT call a
+        # function-valued expression. The body below was written as a bare
+        # `() => {...}` arrow, which merely constructed a function and threw it
+        # away, so none of the stealth patches or captcha hooks below ever ran.
+        # It must self-invoke. Verified: with the bare arrow, window.hcaptcha /
+        # window.turnstile stay undefined and navigator.webdriver stays false;
+        # self-invoked they are object/object and webdriver is null.
         await context.add_init_script("""
-        () => {
+        (() => {
             // ── STEALTH PATCHES (each wrapped to prevent cascade failure) ──
             try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e) {}
             try { window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}}; } catch(e) {}
@@ -1288,7 +1296,7 @@ async def _do_login() -> dict:
                 };
                 console.log('INIT_FETCH_INTERCEPT_OK');
             } catch(e) { console.log('INIT_FETCH_INTERCEPT_FAIL:' + e.message); }
-        }
+        })();
         """)
 
         # Intercept requests to capture auth headers and CAPTCHA sitekeys
@@ -1361,6 +1369,13 @@ async def _do_login() -> dict:
                 logger.info("[console] %s", text)
             # Log fake Turnstile events (from route-injected script)
             if text.startswith("FAKE_TS_"):
+                logger.info("[console] %s", text)
+            # Log hCaptcha wrapper/fake events. The accessor hook
+            # (HC_SETTER_INTERCEPTED_REAL_API), the real-api render
+            # interception (HC_REAL_RENDER_INTERCEPTED) and callback capture
+            # (HC_REAL_CB_CAPTURED) all report through these — without them a
+            # failed hCaptcha solve is undiagnosable from the logs.
+            if text.startswith("HC_") or text.startswith("FAKE_HC_"):
                 logger.info("[console] %s", text)
             # Log script additions (from MutationObserver)
             if text.startswith("SCRIPT_ADDED:"):
@@ -1783,7 +1798,7 @@ async def _do_login() -> dict:
                         if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
                         return null;
                     }
-                """)
+                """, isolated_context=False)
                 if sitekey:
                     logger.info("Sitekey from DOM/fake (attempt %d): %s", ts_wait + 1, sitekey)
                     break
@@ -1873,7 +1888,7 @@ async def _do_login() -> dict:
 
                             return r;
                         }
-                    """)
+                    """, isolated_context=False)
                     # Mask password in diagnostic output
                     safe_diag = dict(diag) if diag else {}
                     if "formControls" in safe_diag:
@@ -2109,7 +2124,7 @@ async def _do_login() -> dict:
                             if (!window.__captchaToken) window.__captchaToken = null;
                             return r;
                         }
-                    """)
+                    """, isolated_context=False)
                     logger.info("Turnstile health check: %s", ts_health)
 
                     # ── COMPREHENSIVE DOM DIAGNOSTIC ──
@@ -2327,7 +2342,7 @@ async def _do_login() -> dict:
 
                             return r;
                         }
-                    """, token)
+                    """, token, isolated_context=False)
                     logger.info("Token inject result: %s", inject_result)
 
                     # Wait for Angular change detection to process the input
@@ -2393,7 +2408,7 @@ async def _do_login() -> dict:
                                 }
                                 return r;
                             }
-                        """, token)
+                        """, token, isolated_context=False)
                         logger.info("After load trigger: %s", cb_after)
 
                         # Poll for callback (script load interception is async)
@@ -2406,7 +2421,7 @@ async def _do_login() -> dict:
                                         cb: !!window.__turnstileCallback,
                                         cbs: (window.__allTurnstileCallbacks || []).length,
                                     })
-                                """)
+                                """, isolated_context=False)
                                 if cb_poll.get("cb"):
                                     logger.info("Callback captured after %ds polling!", poll_i + 1)
                                     await page.evaluate("""
@@ -2417,7 +2432,7 @@ async def _do_login() -> dict:
                                             }
                                             console.log('TS_CB_INVOKED_AFTER_POLL cbs=' + cbs.length);
                                         }
-                                    """, token)
+                                    """, token, isolated_context=False)
                                     break
                                 if (poll_i + 1) % 3 == 0:
                                     logger.info("Poll %d/10 — still no callback", poll_i + 1)
@@ -2425,7 +2440,7 @@ async def _do_login() -> dict:
                         # FALLBACK: Directly patch Angular FormGroup
                         # If callback STILL not captured, find Angular's reactive
                         # form and set captcha_api_key directly.
-                        final_cb = await page.evaluate("() => !!window.__turnstileCallback")
+                        final_cb = await page.evaluate("() => !!window.__turnstileCallback", isolated_context=False)
                         if not final_cb:
                             logger.info("Callback never captured — trying Angular FormGroup fallback...")
                             fg_result = await page.evaluate("""
@@ -2507,7 +2522,7 @@ async def _do_login() -> dict:
                                 return null;
                             })(),
                         })
-                    """)
+                    """, isolated_context=False)
                     logger.info("Pre-click state: %s", pre_click)
 
                 except Exception as e:
@@ -2742,7 +2757,7 @@ async def _do_login() -> dict:
                             }
                             return r;
                         }
-                    """, token if token else "")
+                    """, token if token else "", isolated_context=False)
                     logger.info("Wait %d/60 — URL: %s | state: %s",
                                 nav_wait + 1, current_url, state)
 
@@ -2779,7 +2794,7 @@ async def _do_login() -> dict:
                                     catch(e) {}
                                 }
                             }
-                        """, token)
+                        """, token, isolated_context=False)
 
                 # At 40s mark, NUCLEAR FALLBACK — direct login via Playwright request
                 # Bypasses both Angular form validation AND CORS restrictions
