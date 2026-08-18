@@ -928,13 +928,72 @@ async def _do_login() -> dict:
                             catch(e) { return 'hcw0'; }
                         };
                     }
+                    // Make our injected token visible through the vendor API
+                    // too: anything that validates via getResponse() (Angular
+                    // guards, the site's own submit path) would otherwise read
+                    // the REAL widget's empty response and treat the captcha as
+                    // unsolved even after the callback fired.
+                    ['getResponse', 'getRespKey'].forEach(function(fn) {
+                        if (typeof hc[fn] !== 'function') return;
+                        var orig = hc[fn].bind(hc);
+                        hc[fn] = function() {
+                            if (window.__hcaptchaToken) return window.__hcaptchaToken;
+                            try { return orig.apply(this, arguments); }
+                            catch(e) { return ''; }
+                        };
+                    });
                     hc.__wrapped = true;
                     console.log('HC_REAL_WRAPPED_OK');
                 }
 
-                window.hcaptcha = _fakeHc;
-                console.log('INIT_HC_DIRECT hc_type=' + typeof window.hcaptcha);
+                // Install `window.hcaptcha` as an ACCESSOR, not a plain value.
+                //
+                // Why: hcaptcha's api.js is loaded as
+                //   api.js?render=explicit&onload=hCaptchaOnLoad
+                // and its tail does, in one script execution:
+                //   window.hcaptcha = {render: ..., ...};      // plain assign
+                //   ...  setTimeout(function(){ onload() }, 1) // ~1ms later
+                // The site's `hCaptchaOnLoad` is the Angular `apphcaptcha`
+                // directive, which immediately calls
+                // `window.hcaptcha.render(el, {sitekey, callback, ...})`.
+                //
+                // A polling guard (we used setInterval 200ms) loses that race
+                // ~199 times out of 200: the real object replaces our fake and
+                // render() is called on the UNWRAPPED object, so the sitekey and
+                // — critically — the success `callback` are never captured. The
+                // callback is the only channel that reaches Angular: it drives
+                // the directive's `hcaptchaSuccess` @Output, which the container
+                // re-emits as `v2CaptchaSet`, which is what sets the login
+                // form's captcha control and enables the Sign In button. Poking
+                // the `h-captcha-response` textarea does NOT do this — Angular
+                // never reads it.
+                //
+                // A setter wraps synchronously *inside* the assignment, so the
+                // race is structurally gone rather than merely narrowed.
+                var _hcCurrent = _fakeHc;
+                try {
+                    Object.defineProperty(window, 'hcaptcha', {
+                        configurable: true,
+                        enumerable: true,
+                        get: function() { return _hcCurrent; },
+                        set: function(v) {
+                            if (v && typeof v === 'object' && !v.__wrapped) {
+                                console.log('HC_SETTER_INTERCEPTED_REAL_API');
+                                _wrapHcaptcha(v);
+                            }
+                            _hcCurrent = v || _fakeHc;
+                        }
+                    });
+                    console.log('INIT_HC_ACCESSOR_OK');
+                } catch(e) {
+                    // Accessor refused (already non-configurable) — fall back.
+                    window.hcaptcha = _fakeHc;
+                    console.log('INIT_HC_ACCESSOR_FAIL:' + e.message);
+                }
 
+                // Belt-and-braces: if something redefines the property over
+                // ours (killing the setter), catch the real object late. This
+                // is a safety net only — the accessor above is the real fix.
                 var _hcGuardInterval = setInterval(function() {
                     if (typeof window.hcaptcha === 'undefined' ||
                         window.hcaptcha === null) {
@@ -943,7 +1002,7 @@ async def _do_login() -> dict:
                     } else if (window.hcaptcha !== _fakeHc &&
                                !window.hcaptcha.__wrapped) {
                         _wrapHcaptcha(window.hcaptcha);
-                        console.log('HC_GUARD_WRAPPED');
+                        console.log('HC_GUARD_WRAPPED_LATE');
                     }
                 }, 200);
                 setTimeout(function() { clearInterval(_hcGuardInterval); }, 120000);
