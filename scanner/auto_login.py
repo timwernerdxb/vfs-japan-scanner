@@ -1362,6 +1362,13 @@ async def _do_login() -> dict:
             # Log fake Turnstile events (from route-injected script)
             if text.startswith("FAKE_TS_"):
                 logger.info("[console] %s", text)
+            # Log hCaptcha wrapper/fake events. The accessor hook
+            # (HC_SETTER_INTERCEPTED_REAL_API), the real-api render
+            # interception (HC_REAL_RENDER_INTERCEPTED) and callback capture
+            # (HC_REAL_CB_CAPTURED) all report through these — without them a
+            # failed hCaptcha solve is undiagnosable from the logs.
+            if text.startswith("HC_") or text.startswith("FAKE_HC_"):
+                logger.info("[console] %s", text)
             # Log script additions (from MutationObserver)
             if text.startswith("SCRIPT_ADDED:"):
                 logger.info("[console] %s", text)
